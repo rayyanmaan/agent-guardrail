@@ -10,12 +10,13 @@ from __future__ import annotations
 
 import sqlite3
 from dataclasses import dataclass
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Sequence, Tuple
 
 # Whitelisted columns. Field names arrive from model output, so they must
 # never be interpolated into SQL unless they appear here.
 COLUMNS = ("id", "name", "email", "status", "plan", "seats", "notes", "last_contacted")
 EDITABLE_FIELDS = frozenset(COLUMNS) - {"id"}
+BOUND_OPS = ("<=", ">=")
 
 
 @dataclass(frozen=True)
@@ -62,27 +63,35 @@ class MockCRM:
         record_id: str,
         expected: Dict[str, Any],
         changes: Dict[str, Any],
+        bounds: Sequence[Tuple[str, str, Any]] = (),
     ) -> UpdateResult:
-        """Write `changes` only if every field in `expected` still holds that value.
+        """Write `changes` only if every field in `expected` still holds that value
+        and every (field, op, limit) in `bounds` still holds, op being "<=" or ">=".
 
         The check and the write are a single UPDATE statement, so nothing can
         land between them. This closes the gap between the guardrail's recheck
         and the actual effect (TOCTOU).
         """
-        if not expected:
+        if not expected and not bounds:
             # An unconditional write would bypass the whole guardrail.
-            raise ValueError("conditional_update requires a non-empty expected snapshot")
+            raise ValueError("conditional_update requires a non-empty expected snapshot or bounds")
         _check_fields(expected)
         _check_fields(changes)
+        _check_fields({col: None for col, _, _ in bounds})
+        if any(op not in BOUND_OPS for _, op, _ in bounds):
+            raise ValueError(f"bound operators must be one of {BOUND_OPS}")
         if "id" in changes:
             raise ValueError("id is not editable")
 
         set_sql = ", ".join(f"{col} = ?" for col in changes)
         # `IS` rather than `=` so a NULL in the snapshot compares equal to NULL.
-        where_sql = " AND ".join(f"{col} IS ?" for col in expected)
+        # A NULL under a bound compares as NULL, so the write is refused.
+        where_sql = " AND ".join(
+            [f"{col} IS ?" for col in expected] + [f"{col} {op} ?" for col, op, _ in bounds]
+        )
         cur = self._conn.execute(
             f"UPDATE customers SET {set_sql} WHERE id = ? AND {where_sql}",
-            (*changes.values(), record_id, *expected.values()),
+            (*changes.values(), record_id, *expected.values(), *(limit for _, _, limit in bounds)),
         )
         self._conn.commit()
         if cur.rowcount == 1:
