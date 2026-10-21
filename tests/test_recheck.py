@@ -4,9 +4,9 @@ from langchain_core.messages import HumanMessage
 from agent.graph import ScriptedPlanner, build_graph
 from guardrail.ledger import Ledger
 from guardrail.recheck import compare, take_snapshot
+from scenarios.crm_benchmark import NOTES_AND_CONTACT as SCENARIO_B
+from scenarios.crm_benchmark import STATUS_CANCELLED as SCENARIO_A
 from scenarios.runner import run_scenario
-from scenarios.scenario_a_stale import SCENARIO as SCENARIO_A
-from scenarios.scenario_b_legitimate import SCENARIO as SCENARIO_B
 from tools.crm_dependencies import dependencies_for
 from tools.mock_crm import MockCRM
 
@@ -15,8 +15,9 @@ RECORD = dict(SCENARIO_A.seed)
 
 # ---- dependency-set comparison ------------------------------------------
 
-def test_plan_edit_depends_on_plan_and_status():
-    assert dependencies_for("plan") == ("plan", "status")
+def test_plan_edit_dependency_set():
+    # Sprint 2 added the seats bound to the plan edit's dependency set.
+    assert dependencies_for("plan") == ("plan", "status", "seats")
 
 
 def test_snapshot_holds_only_dependency_fields():
