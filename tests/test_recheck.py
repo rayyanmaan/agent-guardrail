@@ -5,12 +5,15 @@ from agent.graph import ScriptedPlanner, build_graph
 from guardrail.ledger import Ledger
 from guardrail.recheck import compare, take_snapshot
 from scenarios.crm_benchmark import NOTES_AND_CONTACT as SCENARIO_B
+from scenarios.crm_benchmark import SEED, edit_script
 from scenarios.crm_benchmark import STATUS_CANCELLED as SCENARIO_A
 from scenarios.runner import run_scenario
 from tools.crm_dependencies import dependencies_for
+from tools.crm_tool import CRMTool
 from tools.mock_crm import MockCRM
+from tools.registry import TOOL_TYPES
 
-RECORD = dict(SCENARIO_A.seed)
+RECORD = dict(SEED)
 
 
 # ---- dependency-set comparison ------------------------------------------
@@ -85,7 +88,7 @@ def test_toctou_change_between_recheck_and_write_is_refused(crm, tmp_path):
     """Recheck passes, then a dependency changes before the write lands."""
     ledger = Ledger(str(tmp_path / "ledger.sqlite"))
     graph = build_graph(
-        ScriptedPlanner("C-1001", "plan", "growth"), crm, ledger,
+        ScriptedPlanner(edit_script("C-1001", "plan", "growth")), [CRMTool(crm)], ledger,
         before_write=lambda: crm.mutate_out_of_band("C-1001", status="suspended"),
     )
     config = {"configurable": {"thread_id": "toctou"}}
@@ -105,6 +108,6 @@ def test_toctou_change_between_recheck_and_write_is_refused(crm, tmp_path):
 
 @pytest.mark.parametrize("scenario", [SCENARIO_A, SCENARIO_B], ids=["A_stale", "B_unrelated"])
 def test_scenarios_pass_with_scripted_planner(scenario, tmp_path):
-    result = run_scenario(scenario, lambda s: ScriptedPlanner(**s.proposal), str(tmp_path))
+    result = run_scenario(scenario, lambda s: ScriptedPlanner(s.script), str(tmp_path), TOOL_TYPES)
     assert result.passed, result.failures
     assert result.outcome == scenario.expected_outcome

@@ -25,6 +25,20 @@ def seat_cap_for_new_plan(proposal: Dict[str, Any]) -> int:
     return PLAN_SEAT_CAP.get(proposal["new_value"], 0)
 
 
+# Volume discounts are only for accounts of this many seats or more...
+MIN_SEATS_FOR_DISCOUNT = 10
+# ...that are not carrying more than this much unpaid balance.
+MAX_BALANCE_FOR_DISCOUNT = 1000
+
+
+def min_seats_for_discount(_proposal: Dict[str, Any]) -> int:
+    return MIN_SEATS_FOR_DISCOUNT
+
+
+def max_balance_for_discount(_proposal: Dict[str, Any]) -> int:
+    return MAX_BALANCE_FOR_DISCOUNT
+
+
 # Every edit depends on the account still being in the state it was approved in.
 # Guards: acting on an account that was cancelled, suspended or frozen after the
 # plan was approved (e.g. upgrading and billing a customer who just churned).
@@ -45,6 +59,14 @@ _EXTRA_DEPENDENCIES: Dict[str, Tuple[Dependency, ...]] = {
     # Guards: sending account mail to an address chosen against a stale name
     # (e.g. record was re-assigned to a different person).
     "email": (Equality("name"),),
+    "discount_pct": (
+        # Guards: a volume discount approved for a large team landing after the
+        # team shrank below the volume threshold.
+        Bound("seats", ">=", min_seats_for_discount),
+        # Guards: discounting an account that fell behind on payment while the
+        # change waited.
+        Bound("balance_due", "<=", max_balance_for_discount),
+    ),
 }
 
 

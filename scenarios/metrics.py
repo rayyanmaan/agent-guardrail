@@ -11,7 +11,7 @@ and reports always show it so it cannot hide.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Iterable, Optional, Tuple
+from typing import Dict, Iterable, Optional, Tuple
 
 
 @dataclass(frozen=True)
@@ -76,3 +76,54 @@ def format_table(c: Confusion) -> str:
 
 def _rate(numerator: int, denominator: int) -> Optional[float]:
     return numerator / denominator if denominator else None
+
+
+# ---- in-scope vs overall, and per-tool breakdowns ---------------------------------
+
+@dataclass(frozen=True)
+class Scored:
+    """One scenario's result, reduced to what the metrics need."""
+    key: str
+    tool: str
+    shape: str
+    in_scope: bool            # the failure shape is one the recheck mechanism is built to catch
+    expected: str             # "BLOCK" | "ALLOW"
+    actual: Optional[str]     # "BLOCK" | "ALLOW" | None (no valid outcome)
+
+
+@dataclass(frozen=True)
+class Summary:
+    in_scope: Confusion             # recheck-mechanism scenarios only
+    overall: Confusion              # every scenario
+    uncaught: Tuple[Scored, ...]    # should BLOCK, was allowed
+    false_alarms: Tuple[Scored, ...]  # should ALLOW, was blocked
+
+    @property
+    def in_scope_catch_rate(self) -> Optional[float]:
+        """The fair measure of the mechanism: stale-facts cases blocked."""
+        return self.in_scope.catch_rate
+
+    @property
+    def coverage(self) -> Optional[float]:
+        """All dangerous cases blocked, including shapes outside the mechanism."""
+        return self.overall.catch_rate
+
+    @property
+    def false_alarm_rate(self) -> Optional[float]:
+        return self.overall.false_alarm_rate
+
+
+def summarize(rows: Iterable[Scored]) -> Summary:
+    rows = list(rows)
+    return Summary(
+        in_scope=confusion((r.expected, r.actual) for r in rows if r.in_scope),
+        overall=confusion((r.expected, r.actual) for r in rows),
+        uncaught=tuple(r for r in rows if r.expected == "BLOCK" and r.actual == "ALLOW"),
+        false_alarms=tuple(r for r in rows if r.expected == "ALLOW" and r.actual == "BLOCK"),
+    )
+
+
+def by_tool(rows: Iterable[Scored]) -> Dict[str, Summary]:
+    rows = list(rows)
+    return {tool: summarize(r for r in rows if r.tool == tool)
+            for tool in sorted({r.tool for r in rows})}
