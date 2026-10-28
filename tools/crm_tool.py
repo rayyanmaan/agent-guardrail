@@ -70,6 +70,9 @@ class CRMTool:
     def dependencies(self, action: Dict[str, Any]):
         return dependency_specs(action["field"])
 
+    def writes(self, action: Dict[str, Any]) -> Dict[str, Any]:
+        return {action["field"]: action["new_value"]}
+
     def apply(self, action: Dict[str, Any], expected: Dict[str, Any],
               bounds: Sequence[Tuple[str, str, Any]]) -> UpdateResult:
         return self.crm.conditional_update(

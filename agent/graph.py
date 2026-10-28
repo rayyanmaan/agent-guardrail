@@ -20,6 +20,10 @@ arrives (which would silently absorb any change that landed in between). The
 values come from the tool result, not from the model's arguments, so the model
 cannot misstate what it read.
 
+Conditions are rebuilt from the proposal (a pure function of the action and
+the decision snapshot) wherever they are needed, rather than read back from
+state, because canonicalizers are functions. The copy in state is a record.
+
 Replay safety: the live re-read happens inside the `recheck` node and its result
 is written to state. The branch after it reads only `state["verdict"]`, never
 the store, so replaying from a checkpoint takes the same branch.
@@ -62,6 +66,7 @@ class AgentState(TypedDict, total=False):
     proposal: Optional[Dict[str, Any]]   # {tool, action, decision: {values, read_at}}
     conditions: Optional[List[Dict[str, Any]]]  # approval basis, as Condition.to_dict()
     verdict: Optional[Dict[str, Any]]    # recheck result, see guardrail.recheck.Verdict
+    recheck_values: Optional[Dict[str, Any]]  # equality fields as read at recheck; the write's compare-and-set basis
     outcome: Optional[str]               # "allowed" | "blocked" | "no_proposal"
     block_reason: Optional[str]
 
@@ -144,11 +149,16 @@ def build_graph(
 
     # ---- guardrail nodes ------------------------------------------------
 
+    def conditions_for(p: Dict[str, Any]) -> List[Condition]:
+        tool = by_name[p["tool"]]
+        deps = tool.dependencies(p["action"])
+        return make_conditions(deps, p["action"], p["decision"]["values"], tool.writes(p["action"]))
+
     def approve(state: AgentState) -> dict:
         p = state["proposal"]
         deps = by_name[p["tool"]].dependencies(p["action"])
         decision = p["decision"]
-        conditions = make_conditions(deps, p["action"], decision["values"])
+        conditions = conditions_for(p)
         ledger.append(state["run_id"], "approval", {
             "proposal": action_of(p),
             "policy": policy,
@@ -162,9 +172,11 @@ def build_graph(
         p = state["proposal"]
         tool = by_name[p["tool"]]
         current = tool.read(p["action"][tool.target_arg]) or {}
-        verdict = evaluate(_conditions(state), current)
+        conditions = conditions_for(p)
+        verdict = evaluate(conditions, current)
         ledger.append(state["run_id"], "recheck", {"proposal": action_of(p), "verdict": verdict})
-        return {"verdict": dict(verdict)}
+        seen = {c.field: current.get(c.field) for c in conditions if c.op == "=="}
+        return {"verdict": dict(verdict), "recheck_values": seen}
 
     def route_on_verdict(state: AgentState) -> str:
         # Depends only on stored state, never on a live read (replay-safe).
@@ -183,12 +195,18 @@ def build_graph(
     def effect(state: AgentState) -> dict:
         p = state["proposal"]
         tool = by_name[p["tool"]]
-        conditions = _conditions(state)
+        conditions = conditions_for(p)
         if before_write is not None:
             before_write()
+        # The write requires every equality field to still hold exactly the raw
+        # value the recheck accepted. Without canonicalization or convergence
+        # that is the decision snapshot itself. With them, it may be an
+        # equivalent value (e.g. a lowercased address), and the write must not
+        # re-reject what the recheck accepted. Either way any change after the
+        # recheck, even an equivalent one, is refused: the write stays exact.
         result = tool.apply(
             p["action"],
-            expected={c.field: c.value for c in conditions if c.op == "=="},
+            expected=state["recheck_values"],
             bounds=[(c.field, c.op, c.value) for c in conditions if c.op != "=="],
         )
         if result.written:
@@ -224,10 +242,6 @@ def build_graph(
     # Pause after approval: this is where a human would sign off, and where the
     # world can drift away from the approved snapshot.
     return g.compile(checkpointer=InMemorySaver(), interrupt_before=["recheck"])
-
-
-def _conditions(state: AgentState) -> List[Condition]:
-    return [Condition.from_dict(d) for d in state["conditions"]]
 
 
 def _now() -> str:

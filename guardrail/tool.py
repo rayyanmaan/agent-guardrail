@@ -41,6 +41,13 @@ class GuardedTool(Protocol):
     def dependencies(self, action: Dict[str, Any]) -> Sequence[Dependency]:
         """Explicit dependency set the action relies on."""
 
+    def writes(self, action: Dict[str, Any]) -> Dict[str, Any]:
+        """Fields of the target the action sets, and the values it sets them to.
+
+        Used only for the canonical policy's convergence rule. A field not
+        listed here can never converge.
+        """
+
     def apply(self, action: Dict[str, Any], expected: Dict[str, Any],
               bounds: Sequence[Tuple[str, str, Any]]) -> EffectResult:
         """Perform the effect only if every expected value and bound still holds,

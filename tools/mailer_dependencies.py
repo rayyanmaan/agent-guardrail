@@ -15,10 +15,23 @@ from typing import Any, Dict, Tuple
 
 from guardrail.policy import Dependency, Equality
 
+def canonical_email(value: Any) -> Any:
+    """Fold case and trim surrounding whitespace; nothing else.
+
+    Safe because mail routing treats the domain as case-insensitive, providers
+    treat the local part the same way in practice, and surrounding whitespace is
+    an entry artifact, not part of an address. Deliberately not folded: dots,
+    "+tags", and anything else, since those can name different mailboxes.
+    """
+    return value.strip().lower() if isinstance(value, str) else value
+
+
 SEND_DEPENDENCIES: Tuple[Dependency, ...] = (
     # Guards: sending to an address that changed after the agent read the
     # contact (e.g. the person left, and the address now reaches someone else).
-    Equality("recipient_email"),
+    # Under the canonical policy, a change in case or surrounding whitespace
+    # alone is not a change of address.
+    Equality("recipient_email", canonical_email),
     # Guards: sending after the contact opted out while the message waited.
     Equality("opt_in_status"),
 )

@@ -2,7 +2,11 @@
 
     python run.py                    # agent driven by Ollama (qwen2.5:7b-instruct)
     python run.py --scripted         # deterministic planner instead of the LLM
-    python run.py --policy bounded   # one policy only (default: bounded and naive)
+    python run.py --policy canonical # one policy only (default: all three)
+
+Policies: naive (strict equality on every dependency), bounded (equality +
+bounds, strict comparison), canonical (bounded + per-field canonicalization and
+target convergence on equality fields).
 
 Three numbers, never combined:
   in-scope catch    stale-facts cases blocked / all stale-facts cases
@@ -30,7 +34,7 @@ from scenarios.metrics import Summary, by_tool, format_rate, format_table, summa
 from scenarios.runner import run_benchmark  # noqa: E402
 from tools.registry import TOOL_SCHEMAS, TOOL_TYPES  # noqa: E402
 
-POLICY_NAMES = ("bounded", "naive")
+POLICY_NAMES = ("naive", "bounded", "canonical")
 METRICS = (
     ("in-scope catch", lambda s: (s.in_scope.blocked_should_block, s.in_scope.dangerous)),
     ("overall coverage", lambda s: (s.overall.blocked_should_block, s.overall.dangerous)),
@@ -42,7 +46,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--scripted", action="store_true", help="use the deterministic planner, no Ollama")
     parser.add_argument("--model", default="qwen2.5:7b-instruct", help="Ollama model name")
-    parser.add_argument("--policy", choices=POLICY_NAMES + ("both",), default="both")
+    parser.add_argument("--policy", choices=POLICY_NAMES + ("all",), default="all")
     parser.add_argument("--workdir", help="where to write the SQLite files (default: a temp dir)")
     args = parser.parse_args()
 
@@ -53,7 +57,7 @@ def main() -> int:
         model = make_ollama_model(TOOL_SCHEMAS, args.model)
         make_model = lambda s: model
         driver = f"ollama:{args.model}"
-    policies = POLICY_NAMES if args.policy == "both" else (args.policy,)
+    policies = POLICY_NAMES if args.policy == "all" else (args.policy,)
 
     workdir = args.workdir or tempfile.mkdtemp(prefix="guardrail-run-")
     print(f"Agent driver: {driver}\nDatabases:    {workdir}\nScenarios:    {len(SCENARIOS)}")
@@ -95,6 +99,25 @@ def main() -> int:
                     s = overall if scope == "overall" else tools[scope]
                     cells.append(format_rate(*pick(s)))
                 print(f"  {label:<19}{scope:<10}" + "".join(f"{c:<16}" for c in cells))
+
+    if "bounded" in summaries and "canonical" in summaries:
+        print("\n=== False-alarm rate before / after canonicalization ===")
+        columns = [p for p in ("naive", "bounded", "canonical") if p in summaries]
+        heads = {"naive": "naive", "bounded": "before (strict)", "canonical": "after (canonical)"}
+        print(f"  {'scope':<10}" + "".join(f"{heads[p]:<20}" for p in columns))
+        for scope in ["overall", *summaries["bounded"][1]]:
+            cells = []
+            for p in columns:
+                overall, tools = summaries[p]
+                s = overall if scope == "overall" else tools[scope]
+                cells.append(format_rate(s.overall.blocked_should_allow, s.overall.legitimate))
+            print(f"  {scope:<10}" + "".join(f"{c:<20}" for c in cells))
+        cleared = ({r.key for r in summaries["bounded"][0].false_alarms}
+                   - {r.key for r in summaries["canonical"][0].false_alarms})
+        flipped = ({r.key for r in summaries["canonical"][0].uncaught}
+                   - {r.key for r in summaries["bounded"][0].uncaught})
+        print(f"\n  False alarms cleared:            {', '.join(sorted(cleared)) or 'none'}")
+        print(f"  Dangerous cases newly allowed:   {', '.join(sorted(flipped)) or 'none'}")
     return 0 if harness_ok else 1
 
 
