@@ -5,17 +5,19 @@ from agent.graph import ScriptedPlanner, build_graph
 from guardrail.ledger import Ledger
 from guardrail.policy import bounded_policy, naive_policy
 from guardrail.recheck import Condition, evaluate
-from scenarios.crm_benchmark import BY_KEY, DECISION_TIME_DRIFT, SCENARIOS, SEED
+from scenarios.crm_benchmark import BY_KEY, DECISION_TIME_DRIFT, SCENARIOS, SEED, edit_script
 from scenarios.metrics import Confusion, confusion
 from scenarios.runner import confusion_of, run_benchmark, run_scenario
 from tools.crm_dependencies import dependency_specs
+from tools.crm_tool import CRMTool
 from tools.mock_crm import MockCRM
+from tools.registry import TOOL_TYPES
 
 PLAN_TO_GROWTH = {"record_id": "C-1001", "field": "plan", "new_value": "growth"}
 
 
 def scripted(scenario):
-    return ScriptedPlanner(**scenario.proposal)
+    return ScriptedPlanner(scenario.script)
 
 
 @pytest.fixture
@@ -34,7 +36,7 @@ def test_change_between_read_and_proposal_blocks(tmp_path):
     # from the agent's read, so the recheck sees status move and blocks. In
     # Sprint 1, approval took a fresh read at this point, so it approved against
     # the suspended row and the write was wrongly allowed.
-    result = run_scenario(DECISION_TIME_DRIFT, scripted, str(tmp_path))
+    result = run_scenario(DECISION_TIME_DRIFT, scripted, str(tmp_path), TOOL_TYPES)
     assert result.passed, result.failures
     assert result.outcome == "blocked"
 
@@ -52,7 +54,7 @@ def test_fresh_read_baseline_would_have_missed_it(crm):
 
 def test_approval_ledger_records_decision_snapshot(tmp_path, crm):
     ledger = Ledger(str(tmp_path / "ledger.sqlite"))
-    graph = build_graph(ScriptedPlanner(**PLAN_TO_GROWTH), crm, ledger,
+    graph = build_graph(ScriptedPlanner(edit_script(**PLAN_TO_GROWTH)), [CRMTool(crm)], ledger,
                         after_read=lambda: crm.mutate_out_of_band("C-1001", status="suspended"))
     graph.invoke({"messages": [HumanMessage("upgrade")], "run_id": "r"},
                  {"configurable": {"thread_id": "r"}})
@@ -69,7 +71,7 @@ class _ProposeWithoutReading:
 
 def test_proposal_without_a_read_is_refused(tmp_path, crm):
     ledger = Ledger(str(tmp_path / "ledger.sqlite"))
-    graph = build_graph(_ProposeWithoutReading(), crm, ledger)
+    graph = build_graph(_ProposeWithoutReading(), [CRMTool(crm)], ledger)
     state = graph.invoke({"messages": [HumanMessage("upgrade")], "run_id": "r"},
                          {"configurable": {"thread_id": "r"}})
     assert state["outcome"] == "no_proposal"
@@ -143,15 +145,15 @@ def test_benchmark_is_balanced_and_covers_every_label():
 
 
 def test_bounded_policy_passes_every_scenario(tmp_path):
-    results = run_benchmark(SCENARIOS, scripted, str(tmp_path), "bounded")
+    results = run_benchmark(SCENARIOS, scripted, str(tmp_path), TOOL_TYPES, "bounded")
     assert [r.scenario.key for r in results if not r.passed] == []
     c = confusion_of(results)
     assert (c.catch_rate, c.false_alarm_rate) == (1.0, 0.0)
 
 
 def test_naive_baseline_raises_false_alarms_only(tmp_path):
-    bounded = confusion_of(run_benchmark(SCENARIOS, scripted, str(tmp_path), "bounded"))
-    naive_results = run_benchmark(SCENARIOS, scripted, str(tmp_path), "naive")
+    bounded = confusion_of(run_benchmark(SCENARIOS, scripted, str(tmp_path), TOOL_TYPES, "bounded"))
+    naive_results = run_benchmark(SCENARIOS, scripted, str(tmp_path), TOOL_TYPES, "naive")
     naive = confusion_of(naive_results)
     assert naive.catch_rate == bounded.catch_rate
     assert naive.false_alarm_rate > bounded.false_alarm_rate

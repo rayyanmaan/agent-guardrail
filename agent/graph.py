@@ -1,16 +1,19 @@
-"""LangGraph agent with the guardrail wired in front of the only write path.
+"""LangGraph agent with the guardrail wired in front of every effect.
 
 Flow:
-    agent <-> act            model reads the record, then proposes one edit
+    agent <-> act            model reads what it needs, then proposes one effect
     approve                  guardrail derives approval conditions from the
                              agent's decision snapshot, logs approval
     -- interrupt --          approval wait; the world may change here
     recheck                  guardrail re-reads, evaluates, stores verdict in state
     effect | block           routed on the stored verdict only
-    effect                   conditional_update (compare-and-set) closes TOCTOU
+    effect                   the tool's conditional effect (compare-and-set) closes TOCTOU
 
-Decision snapshot: whatever read_record returned to the model is recorded in
-state, with the time of the read. When the model calls propose_update, the act
+Tools are passed in as adapters (guardrail.tool.GuardedTool); nothing here
+knows about any particular tool.
+
+Decision snapshot: whatever a read tool returned to the model is recorded in
+state, with the time of the read. When the model calls a propose tool, the act
 node attaches that read to the proposal. The approval basis is what the agent
 actually saw when it decided, not a fresh read taken when the proposal
 arrives (which would silently absorb any change that landed in between). The
@@ -19,21 +22,19 @@ cannot misstate what it read.
 
 Replay safety: the live re-read happens inside the `recheck` node and its result
 is written to state. The branch after it reads only `state["verdict"]`, never
-the database, so replaying from a checkpoint takes the same branch.
+the store, so replaying from a checkpoint takes the same branch.
 
-The model never gets a write tool. Its tools are read_record (reads) and
-propose_update (records intent only). Only guardrail code touches the ledger or
-calls conditional_update.
+The model never gets a write tool. Its tools are reads and proposals, which
+record intent only. Only guardrail code touches the ledger or calls an effect.
 """
 
 from __future__ import annotations
 
 import json
 from datetime import datetime, timezone
-from typing import Annotated, Any, Callable, Dict, List, Optional, TypedDict
+from typing import Annotated, Any, Callable, Dict, List, Optional, Sequence, TypedDict
 
 from langchain_core.messages import AIMessage, AnyMessage, HumanMessage, SystemMessage, ToolMessage
-from langchain_core.tools import tool
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
@@ -41,15 +42,14 @@ from langgraph.graph.message import add_messages
 from guardrail.ledger import Ledger
 from guardrail.policy import POLICIES
 from guardrail.recheck import Condition, evaluate, take_snapshot
-from tools.crm_dependencies import dependency_specs
-from tools.mock_crm import EDITABLE_FIELDS, MockCRM
+from guardrail.tool import GuardedTool
 
 MAX_RETRIES = 3
 
 SYSTEM_PROMPT = (
-    "You are a CRM operations agent. First call read_record to look up the "
-    "customer. Then call propose_update exactly once with the single field "
-    "change the request needs. You cannot write to the CRM directly: a "
+    "You are an operations agent. First use the read tools to look up every "
+    "record you need. Then call exactly one propose tool with the single change "
+    "or message the request needs. You cannot change anything directly: a "
     "separate system approves and executes your proposal."
 )
 
@@ -58,54 +58,43 @@ class AgentState(TypedDict, total=False):
     messages: Annotated[List[AnyMessage], add_messages]
     run_id: str
     retries: int
-    reads: Dict[str, Dict[str, Any]]     # record_id -> {"values", "read_at"}: what the agent saw
-    proposal: Optional[Dict[str, Any]]   # {record_id, field, new_value, decision: {values, read_at}}
+    reads: Dict[str, Dict[str, Any]]     # "tool:target" -> {"values", "read_at"}: what the agent saw
+    proposal: Optional[Dict[str, Any]]   # {tool, action, decision: {values, read_at}}
     conditions: Optional[List[Dict[str, Any]]]  # approval basis, as Condition.to_dict()
     verdict: Optional[Dict[str, Any]]    # recheck result, see guardrail.recheck.Verdict
     outcome: Optional[str]               # "allowed" | "blocked" | "no_proposal"
     block_reason: Optional[str]
 
 
-@tool
-def read_record(record_id: str) -> str:
-    """Read a customer record from the CRM by id (e.g. 'C-1001')."""
-    raise NotImplementedError("executed by the act node")
-
-
-@tool
-def propose_update(record_id: str, field: str, new_value: str) -> str:
-    """Propose changing one field of a customer record. Does not write; the change
-    is approved and executed by a separate system."""
-    raise NotImplementedError("executed by the act node")
-
-
-AGENT_TOOLS = [read_record, propose_update]
-
-
 def action_of(proposal: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
-    """The proposed action alone, without the attached decision snapshot."""
+    """The proposed action and its tool, without the attached decision snapshot."""
     if proposal is None:
         return None
-    return {k: proposal[k] for k in ("record_id", "field", "new_value")}
+    return {"tool": proposal["tool"], **proposal["action"]}
 
 
 def build_graph(
     model: Any,
-    crm: MockCRM,
+    tools: Sequence[GuardedTool],
     ledger: Ledger,
     before_write: Optional[Callable[[], None]] = None,
     after_read: Optional[Callable[[], None]] = None,
+    after_write: Optional[Callable[[], None]] = None,
     policy: str = "bounded",
 ):
     """Compile the agent graph.
 
     `model` is anything with .invoke(messages) -> AIMessage that emits tool calls
-    for AGENT_TOOLS (a ChatOllama bound with tools, or ScriptedPlanner).
-    `policy` names an entry in guardrail.policy.POLICIES.
-    `after_read` and `before_write` are test seams that simulate the world
-    changing after the agent's read, or between recheck and the write.
+    for the tools' read/propose schemas (a ChatOllama bound with them, or
+    ScriptedPlanner). `policy` names an entry in guardrail.policy.POLICIES.
+    `after_read`, `before_write` and `after_write` are test seams: the world
+    changing after the agent's read, or between recheck and the write, and a
+    fault right after a write commits.
     """
     make_conditions = POLICIES[policy]
+    by_name = {t.name: t for t in tools}
+    read_tools = {t.read_tool.name: t for t in tools}
+    propose_tools = {t.propose_tool.name: t for t in tools}
 
     def agent(state: AgentState) -> dict:
         messages = [SystemMessage(SYSTEM_PROMPT), *state["messages"]]
@@ -115,28 +104,30 @@ def build_graph(
         last = state["messages"][-1]
         retries = state.get("retries", 0)
         if not isinstance(last, AIMessage) or not last.tool_calls:
-            nudge = HumanMessage("You must respond with a tool call (read_record or propose_update).")
+            nudge = HumanMessage("You must respond with a tool call.")
             return {"messages": [nudge], "retries": retries + 1}
 
         reads = dict(state.get("reads") or {})
         replies: List[ToolMessage] = []
         proposal = None
         for call in last.tool_calls:
-            if call["name"] == "read_record":
-                record_id = str(call["args"].get("record_id", "")).strip()
-                record = crm.read_record(record_id)
-                if record:
-                    reads[record_id] = {"values": record, "read_at": _now()}
-                content = json.dumps(record) if record else "error: no such record"
-                if record and after_read is not None:
+            name, args = call["name"], call["args"]
+            if name in read_tools:
+                tool = read_tools[name]
+                target = str(args.get(tool.target_arg, "")).strip()
+                values = tool.read(target)
+                if values:
+                    reads[_read_key(tool, target)] = {"values": values, "read_at": _now()}
+                content = json.dumps(values) if values else f"error: no {tool.name} record {target!r}"
+                if values and after_read is not None:
                     after_read()
-            elif call["name"] == "propose_update" and proposal is None:
-                proposal, error = _validate_proposal(call["args"], reads)
+            elif name in propose_tools and proposal is None:
+                proposal, error = _make_proposal(propose_tools[name], args, reads)
                 content = error or "proposal submitted for approval"
                 if error:
                     retries += 1
             else:
-                content = f"error: unknown or repeated tool call {call['name']!r}"
+                content = f"error: unknown or repeated tool call {name!r}"
                 retries += 1
             replies.append(ToolMessage(content, tool_call_id=call["id"]))
         return {"messages": replies, "reads": reads, "proposal": proposal, "retries": retries}
@@ -155,9 +146,9 @@ def build_graph(
 
     def approve(state: AgentState) -> dict:
         p = state["proposal"]
-        deps = dependency_specs(p["field"])
+        deps = by_name[p["tool"]].dependencies(p["action"])
         decision = p["decision"]
-        conditions = make_conditions(deps, p, decision["values"])
+        conditions = make_conditions(deps, p["action"], decision["values"])
         ledger.append(state["run_id"], "approval", {
             "proposal": action_of(p),
             "policy": policy,
@@ -169,7 +160,8 @@ def build_graph(
 
     def recheck(state: AgentState) -> dict:
         p = state["proposal"]
-        current = crm.read_record(p["record_id"]) or {}
+        tool = by_name[p["tool"]]
+        current = tool.read(p["action"][tool.target_arg]) or {}
         verdict = evaluate(_conditions(state), current)
         ledger.append(state["run_id"], "recheck", {"proposal": action_of(p), "verdict": verdict})
         return {"verdict": dict(verdict)}
@@ -190,22 +182,24 @@ def build_graph(
 
     def effect(state: AgentState) -> dict:
         p = state["proposal"]
+        tool = by_name[p["tool"]]
         conditions = _conditions(state)
         if before_write is not None:
             before_write()
-        result = crm.conditional_update(
-            p["record_id"],
+        result = tool.apply(
+            p["action"],
             expected={c.field: c.value for c in conditions if c.op == "=="},
-            changes={p["field"]: p["new_value"]},
             bounds=[(c.field, c.op, c.value) for c in conditions if c.op != "=="],
         )
         if result.written:
+            if after_write is not None:
+                after_write()
             ledger.append(state["run_id"], "allow", {"proposal": action_of(p), "write": result.reason})
             return {"outcome": "allowed"}
         # Recheck passed but the compare-and-set did not: something changed in
         # the window between recheck and write. Re-read only to say which field
         # moved in the ledger; the write was already refused.
-        moved = evaluate(conditions, crm.read_record(p["record_id"]) or {})
+        moved = evaluate(conditions, tool.read(p["action"][tool.target_arg]) or {})
         ledger.append(state["run_id"], "block", {
             "proposal": action_of(p),
             "stage": "conditional_update",
@@ -240,64 +234,56 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def _validate_proposal(args: Dict[str, Any], reads: Dict[str, Dict[str, Any]]):
+def _read_key(tool: GuardedTool, target: str) -> str:
+    return f"{tool.name}:{target}"
+
+
+def _make_proposal(tool: GuardedTool, args: Dict[str, Any], reads: Dict[str, Dict[str, Any]]):
     """Return (proposal, None) or (None, error message for the model to retry on).
 
-    The proposal carries the agent's own read of the record as its decision
-    snapshot. A proposal for a record the agent never read is refused: there is
+    The proposal carries the agent's own read of the target as its decision
+    snapshot. A proposal for a target the agent never read is refused: there is
     no decision basis to approve it against.
     """
-    record_id = str(args.get("record_id", "")).strip()
-    field = str(args.get("field", "")).strip()
-    new_value = args.get("new_value")
-    if field not in EDITABLE_FIELDS:
-        return None, f"error: field must be one of {sorted(EDITABLE_FIELDS)}"
-    decision = reads.get(record_id)
+    target = str(args.get(tool.target_arg, "")).strip()
+    decision = reads.get(_read_key(tool, target))
     if decision is None:
-        return None, f"error: call read_record for {record_id!r} before proposing a change to it"
-    if new_value is None:
-        return None, "error: new_value is required"
-    # Keep the proposed value's type consistent with the column, so strict
-    # equality and the compare-and-set behave predictably.
-    if isinstance(decision["values"][field], int):
-        try:
-            new_value = int(new_value)
-        except (TypeError, ValueError):
-            return None, f"error: {field} must be an integer"
-    else:
-        new_value = str(new_value).strip()
-    return {"record_id": record_id, "field": field, "new_value": new_value, "decision": decision}, None
+        return None, f"error: call {tool.read_tool.name} for {target!r} before proposing a change to it"
+    action, error = tool.validate({**args, tool.target_arg: target}, decision["values"])
+    if error:
+        return None, error
+    return {"tool": tool.name, "action": action, "decision": decision}, None
 
 
 # ---- models -------------------------------------------------------------
 
-def make_ollama_model(model_name: str = "qwen2.5:7b-instruct", base_url: Optional[str] = None):
+def make_ollama_model(tool_schemas: Sequence[Any], model_name: str = "qwen2.5:7b-instruct",
+                      base_url: Optional[str] = None):
     from langchain_ollama import ChatOllama
 
     kwargs = {"model": model_name, "temperature": 0}
     if base_url:
         kwargs["base_url"] = base_url
-    return ChatOllama(**kwargs).bind_tools(AGENT_TOOLS)
+    return ChatOllama(**kwargs).bind_tools(list(tool_schemas))
 
 
 class ScriptedPlanner:
-    """Deterministic stand-in for the LLM: read the record, then propose `change`.
+    """Deterministic stand-in for the LLM: emits a fixed sequence of tool calls.
 
-    Used by the unit tests and by `run.py --scripted` so the guardrail can be
-    exercised without Ollama. Everything downstream of the model is identical.
+    `calls` is a sequence of (tool_name, args), one per turn, e.g. a read then a
+    proposal. Used by the unit tests and by `run.py --scripted` so the guardrail
+    can be exercised without Ollama. Everything downstream of the model is identical.
     """
 
-    def __init__(self, record_id: str, field: str, new_value: Any):
-        self.record_id, self.field, self.new_value = record_id, field, new_value
-        self._calls = 0
+    def __init__(self, calls: Sequence[Any]):
+        self.calls = [(name, dict(args)) for name, args in calls]
+        self._turns = 0
 
     def invoke(self, messages: List[AnyMessage]) -> AIMessage:
-        self._calls += 1
-        has_read = any(isinstance(m, ToolMessage) for m in messages)
-        if not has_read:
-            call = {"name": "read_record", "args": {"record_id": self.record_id}}
-        else:
-            call = {"name": "propose_update", "args": {
-                "record_id": self.record_id, "field": self.field, "new_value": self.new_value,
-            }}
-        return AIMessage("", tool_calls=[{**call, "id": f"call_{self._calls}", "type": "tool_call"}])
+        self._turns += 1
+        step = sum(isinstance(m, ToolMessage) for m in messages)
+        if step >= len(self.calls):
+            return AIMessage("done")
+        name, args = self.calls[step]
+        return AIMessage("", tool_calls=[{"name": name, "args": args,
+                                          "id": f"call_{self._turns}", "type": "tool_call"}])

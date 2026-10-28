@@ -10,11 +10,12 @@ from __future__ import annotations
 
 import sqlite3
 from dataclasses import dataclass
-from typing import Any, Dict, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 # Whitelisted columns. Field names arrive from model output, so they must
 # never be interpolated into SQL unless they appear here.
-COLUMNS = ("id", "name", "email", "status", "plan", "seats", "notes", "last_contacted")
+COLUMNS = ("id", "name", "email", "status", "plan", "seats", "notes", "last_contacted",
+           "discount_pct", "balance_due")
 EDITABLE_FIELDS = frozenset(COLUMNS) - {"id"}
 BOUND_OPS = ("<=", ">=")
 
@@ -34,7 +35,8 @@ class MockCRM:
             """CREATE TABLE IF NOT EXISTS customers (
                 id TEXT PRIMARY KEY,
                 name TEXT, email TEXT, status TEXT, plan TEXT,
-                seats INTEGER, notes TEXT, last_contacted TEXT
+                seats INTEGER, notes TEXT, last_contacted TEXT,
+                discount_pct INTEGER, balance_due INTEGER
             )"""
         )
         self._conn.commit()
@@ -57,6 +59,10 @@ class MockCRM:
             "SELECT * FROM customers WHERE id = ?", (record_id,)
         ).fetchone()
         return dict(row) if row else None
+
+    def read_all(self) -> List[Dict[str, Any]]:
+        rows = self._conn.execute("SELECT * FROM customers ORDER BY id").fetchall()
+        return [dict(r) for r in rows]
 
     def conditional_update(
         self,
