@@ -58,6 +58,11 @@ class MailerTool:
     def dependencies(self, action: Dict[str, Any]):
         return dependency_specs(action)
 
+    def writes(self, action: Dict[str, Any]) -> Dict[str, Any]:
+        # A send adds to the outbox; it sets no field on the contact, so no
+        # contact field can ever converge.
+        return {}
+
     def apply(self, action: Dict[str, Any], expected: Dict[str, Any],
               bounds: Sequence[Tuple[str, str, Any]]) -> SendResult:
         return self.mailer.conditional_send(

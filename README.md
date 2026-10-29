@@ -30,16 +30,20 @@ python run.py --scripted --policy bounded   # one policy only
 pytest
 ```
 
-Current result (`--scripted`, 23 scenarios):
+Current result (`--scripted`, 23 scenarios, three policies):
 
 ```
-                     overall         crm             mailer
-  in-scope catch     100% (9/9)      100% (6/6)      100% (3/3)
-  overall coverage   82% (9/11)      100% (6/6)      60% (3/5)
-  false-alarm rate   17% (2/12)      11% (1/9)       33% (1/3)
-
-  Policy comparison, false-alarm rate:  bounded 17% (2/12)   naive 50% (6/12)
+                     scope     naive           bounded         canonical
+  in-scope catch     overall   100% (9/9)      100% (9/9)      100% (9/9)
+  overall coverage   overall   82% (9/11)      82% (9/11)      82% (9/11)
+  false-alarm rate   overall   50% (6/12)      17% (2/12)      0% (0/12)
+  false-alarm rate   crm       56% (5/9)       11% (1/9)       0% (0/9)
+  false-alarm rate   mailer    33% (1/3)       33% (1/3)       0% (0/3)
 ```
+
+- **naive:** strict equality on every dependency field.
+- **bounded:** equality fields plus bound fields, compared strictly (the Sprint 3 policy).
+- **canonical:** bounded, plus the two narrow equality rules described below.
 
 The exit code reports a broken harness (outcome, tool state and ledger
 disagreeing), not a missed or wrongly blocked case. Those are results.
@@ -63,24 +67,53 @@ shapes this mechanism is not designed to catch. It is deliberately below 100%:
 The gap between the two figures is the boundary of what this mechanism can do,
 measured rather than asserted.
 
-**False-alarm rate** covers all 12 legitimate cases. The two false alarms are
-real results, and the policy has not been tuned to hide them:
+**False-alarm rate** covers all 12 legitimate cases. Under the strict bounded
+policy there are two false alarms. Both come from strict equality treating a
+different representation of the same fact as a different fact:
 
 - **`plan_already_target`:** another process already set the plan to growth, the
   value this upgrade writes. The write would change nothing, but `plan` is an
-  equality field, so the guardrail blocks.
+  equality field, so the strict policy blocks.
 - **`mailer_email_case`:** a sync job lowercases `Dana@Acme.example` to
   `dana@acme.example`. It is the same mailbox, but strict equality on
   `recipient_email` blocks the send.
 
-Both come from strict equality treating "a different representation of the same
-fact" as "a different fact". Fixing them would mean per-field normalization or
-"already in target state" detection. Neither is built here.
+The **canonical** policy clears both with two narrow rules on equality fields.
+The rule they follow is that two values count as the same only when they are
+provably the same fact. Hiding a real change would be worse than a false alarm.
 
-**Bounded vs naive.** The naive baseline uses strict equality on every
-dependency field. It has the same catch rate and coverage, but blocks 4 more
-legitimate cases: all the within-limits bound-field moves. On the mailer the two
-policies are identical, because the mailer has no bound fields.
+- **Per-field canonicalizer.** `Equality(field, canonicalize=...)`, identity by
+  default. Only `recipient_email` has one: trim surrounding whitespace and
+  lowercase. Dots, `+tags`, trailing dots and different domains stay distinct.
+  Numbers and money are never canonicalized.
+- **Target convergence.** If a field the action itself writes has already been
+  changed to exactly the value the action would write, the action is a no-op on
+  it, so that change doesn't block. It never applies to a field the action only
+  relies on (`status`, `opt_in_status`, `balance_due`...). Tools declare what
+  they write via `writes(action)`. A send writes no contact field, so nothing
+  on the mailer can converge.
+
+Every accepted equivalence shows up in the ledger's recheck entry as
+`accepted: {field: {approved, current, as: "canonical" | "converged"}}`.
+
+**The write stays exact.** After a recheck passes, the write requires each
+equality field to still hold exactly the raw value the recheck accepted. Any
+change after the recheck is refused, even one that would have been acceptable.
+In the strict policies, the value the recheck accepted is always the decision
+snapshot itself.
+
+**The three-way comparison.**
+
+- **Naive** has the same catch rate and coverage as the others, but blocks every
+  within-limits bound-field move: 50%.
+- **Strict bounded** drops that to 17%.
+- **Canonical** drops it to 0%, and no dangerous case flips to ALLOW.
+
+The before/after comparison uses the same 23 scenarios. The conservatism checks
+are tests in `tests/test_canonical.py`; they weren't added to the benchmark, so
+the before/after numbers compare like for like. They cover: a mixed-case address
+replaced by a different mailbox, the plan moved to a non-target value, and status
+changed to anything, including the value the action writes to `plan`.
 
 **What was co-designed.** The 10 Sprint 2 CRM scenarios were written together
 with the policy (`scenarios/benchmark.py: CO_DESIGNED`). The other 13 were added
@@ -134,7 +167,7 @@ The mailer was added this way, without changing any reusable module.
 
 | Kind | Meaning | Examples |
 |---|---|---|
-| `Equality` | Must not change at all | CRM `plan`, `status`; mailer `recipient_email`, `opt_in_status` |
+| `Equality` | Must not change (optionally: up to a per-field canonical form) | CRM `plan`, `status`; mailer `recipient_email` (case/whitespace-folded), `opt_in_status` |
 | `Bound` | May change, within an approved limit | CRM `seats <= 20` (plan cap); `seats >= 10` and `balance_due <= 1000` (discount) |
 
 ### Scenario fields

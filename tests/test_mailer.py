@@ -9,7 +9,7 @@ from guardrail.ledger import Ledger
 from guardrail.policy import Equality, bounded_policy
 from guardrail.recheck import evaluate
 from scenarios.mailer_benchmark import CONTACT, SEND, send_script
-from tools.mailer_dependencies import dependency_specs
+from tools.mailer_dependencies import canonical_email, dependency_specs
 from tools.mailer_tool import MailerTool
 from tools.mock_mailer import MockMailer
 
@@ -27,7 +27,8 @@ def mailer(tmp_path):
 # ---- dependency set -----------------------------------------------------------
 
 def test_send_depends_on_recipient_and_opt_in_by_equality():
-    assert dependency_specs(SEND) == (Equality("recipient_email"), Equality("opt_in_status"))
+    # Sprint 3.5: recipient_email gained a canonicalizer (used by the canonical policy only).
+    assert dependency_specs(SEND) == (Equality("recipient_email", canonical_email), Equality("opt_in_status"))
 
 
 @pytest.mark.parametrize("change, changed", [
