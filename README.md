@@ -10,27 +10,55 @@ into an append-only, hash-chained ledger.
 Two tools run behind it: a mock CRM (field edits) and a mock mailer (sends).
 A labelled benchmark measures it with three separate numbers.
 
+## Two kinds of run
+
+| | Headline benchmark | Validation pass |
+|---|---|---|
+| Command | `python run.py --scripted` | `python run.py` (needs Ollama) |
+| Agent | `ScriptedPlanner`: a fixed list of tool calls | a real model (`qwen2.5:7b-instruct`) |
+| Deterministic | yes, same numbers every run | no |
+| Scenarios | all 23 | 22: the disclosure case is skipped (see below) |
+| What it measures | the guardrail's catch rate, coverage and false-alarm rate | whether the guardrail behaves the same with a real agent, plus how reliably the model produces a valid proposal (the invalid rate) |
+
+The **headline numbers come from the scripted run**. Only the model changes
+between the two runs; the guardrail, tools, ledger and checks are identical. A
+model run that doesn't propose the scenario's action is **INVALID**. It is left
+out of the catch and false-alarm rates and reported separately as the invalid
+rate, broken down by cause. That number is a finding about the model, not the
+guardrail.
+
+**What counts as the scenario's action.**
+
+- **Mailer sends:** a real model writes its own subject and body, so a send is
+  matched on the contact it goes to. The final-state check uses the text the
+  agent actually wrote.
+- **CRM edits:** matched on every key (record, field, value).
+- **Disclosure case (scripted only):** `mailer_disclosure_by_combination` is
+  matched word for word and runs only on the scripted planner. Its premise is an
+  agent that pastes another customer's deal terms into an email. A benign model
+  won't do that on cue, so a real-model run couldn't test it.
+
 ## Run it
 
-Requires Python 3.9+ (3.11+ recommended) and, for the LLM-driven run, [Ollama](https://ollama.com).
+Requires Python 3.9+ (3.11+ recommended) and, for the validation pass, [Ollama](https://ollama.com).
 
 ```bash
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 
-# LLM-driven run (local, no API keys)
-ollama pull qwen2.5:7b-instruct      # fallback: llama3.1:8b, then --model llama3.1:8b
-python run.py
-
-# Same benchmark with a deterministic planner in place of the LLM
+# Headline benchmark (no Ollama needed)
 python run.py --scripted
-python run.py --scripted --policy bounded   # one policy only
+python run.py --scripted --policy canonical   # one policy only
+
+# Validation pass with a real agent (local, no API keys)
+ollama pull qwen2.5:7b-instruct      # once; keep `ollama serve` or the Ollama app running
+python run.py                        # all three policies, about 15 minutes
 
 # Unit tests (no Ollama needed)
 pytest
 ```
 
-Current result (`--scripted`, 23 scenarios, three policies):
+Headline result (`--scripted`, 23 scenarios, three policies):
 
 ```
                      scope     naive           bounded         canonical
@@ -47,6 +75,51 @@ Current result (`--scripted`, 23 scenarios, three policies):
 
 The exit code reports a broken harness (outcome, tool state and ledger
 disagreeing), not a missed or wrongly blocked case. Those are results.
+
+### Validation pass result (`qwen2.5:7b-instruct`, 22 scenarios, one run per policy)
+
+```
+                     scope     naive           bounded         canonical
+  in-scope catch     overall   100% (9/9)      100% (9/9)      100% (9/9)
+  overall coverage   overall   90% (9/10)      90% (9/10)      90% (9/10)
+  false-alarm rate   overall   50% (6/12)      17% (2/12)      0% (0/12)
+  invalid rate       overall   0% (0/22)       0% (0/22)       0% (0/22)
+```
+
+- **Same decisions as the scripted run:** with a real agent, every one of the 22
+  scenarios got the same guardrail decision as in the headline benchmark, under
+  all three policies.
+- **Coverage is 9/10, not 9/11,** only because the disclosure case is skipped.
+  The one remaining miss is `lost_ack_retry`, as expected.
+
+**Invalid rate, before and after the harness fixes.** In the first real-model
+run (canonical policy, before the fixes), 10 of 23 runs were invalid:
+
+| Cause | Count | What happened | Fix |
+|---|---|---|---|
+| Message-wording mismatch | 8 | All the mailer cases: the model wrote its own subject and body, and the harness required the scripted text. | Sends are now matched on the contact. |
+| Validation format | 2 | Both discount cases: the model sent `field: "discount"` and then `new_value: "15%"`, and ran out of retries. | Error messages now name each field's type and say "a whole number such as 15, with no % sign or units". Validation is as strict as before. |
+
+After the fixes the invalid rate is 0/22. Invalid causes are still reported as
+`different_action`, `validation_format` or `no_proposal`.
+
+**Observations from the validation pass:**
+
+- **Proposing before reading:** the model proposed before reading the target in
+  22 of 22 runs. The guardrail refused each time, which is the intended
+  behaviour, and the model then read and re-proposed. This costs one retry per
+  run.
+- **Own wording:** the model's message wording differed from the script in all 7
+  mailer runs. That is expected, and those runs are accepted because sends are
+  matched on the contact.
+
+**Caveats:**
+
+- **A single run per policy.** Temperature is 0, but local inference isn't
+  guaranteed to be deterministic, so treat these as one observation.
+- **Not a stress test.** The scenarios don't ask the model to misbehave, so this
+  pass shows the guardrail works with a real agent. It doesn't show the model
+  can't get past it.
 
 ## How to read the numbers
 
@@ -194,10 +267,11 @@ out of all rates.
 
 ## Known limits
 
-- **Hand-built scenarios.** They are small and hand-built (see above). The two
-  out-of-scope shapes and the disclosure case rely on the scripted planner to
-  produce the failure. Under a real model they will often come out INVALID,
-  because the model doesn't misbehave on cue.
+- **Hand-built scenarios.** They are small and hand-built (see above).
+  - **Disclosure case:** it relies on the scripted planner to produce the leak,
+    so it's scripted only.
+  - **Lost-ack case:** it does run with a real model, because its failure is an
+    injected fault, not model behaviour.
 - **Permission rules.** The mailer's dependency set asks "is the world still what
   the agent saw?", not "was this allowed in the first place?" A send to a contact
   who was already opted out when the agent read it would pass the recheck.

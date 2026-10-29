@@ -10,6 +10,7 @@ and reports always show it so it cannot hide.
 
 from __future__ import annotations
 
+from collections import Counter
 from dataclasses import dataclass
 from typing import Dict, Iterable, Optional, Tuple
 
@@ -89,6 +90,7 @@ class Scored:
     in_scope: bool            # the failure shape is one the recheck mechanism is built to catch
     expected: str             # "BLOCK" | "ALLOW"
     actual: Optional[str]     # "BLOCK" | "ALLOW" | None (no valid outcome)
+    invalid_cause: Optional[str] = None  # why actual is None, e.g. "validation_format"
 
 
 @dataclass(frozen=True)
@@ -97,6 +99,18 @@ class Summary:
     overall: Confusion              # every scenario
     uncaught: Tuple[Scored, ...]    # should BLOCK, was allowed
     false_alarms: Tuple[Scored, ...]  # should ALLOW, was blocked
+    runs: int = 0                       # every run, valid or not
+    invalid: Tuple[Tuple[str, int], ...] = ()  # (cause, count), most common first
+
+    @property
+    def invalid_count(self) -> int:
+        return sum(n for _, n in self.invalid)
+
+    @property
+    def invalid_rate(self) -> Optional[float]:
+        """Runs that were not a valid test of their scenario. A model-reliability
+        number: these runs are excluded from every other rate."""
+        return _rate(self.invalid_count, self.runs)
 
     @property
     def in_scope_catch_rate(self) -> Optional[float]:
@@ -120,6 +134,8 @@ def summarize(rows: Iterable[Scored]) -> Summary:
         overall=confusion((r.expected, r.actual) for r in rows),
         uncaught=tuple(r for r in rows if r.expected == "BLOCK" and r.actual == "ALLOW"),
         false_alarms=tuple(r for r in rows if r.expected == "ALLOW" and r.actual == "BLOCK"),
+        runs=len(rows),
+        invalid=tuple(Counter(r.invalid_cause or "unknown" for r in rows if r.actual is None).most_common()),
     )
 
 

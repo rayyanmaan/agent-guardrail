@@ -1,7 +1,7 @@
 """Run the labelled benchmark (CRM + mailer) and report the guardrail's numbers.
 
-    python run.py                    # agent driven by Ollama (qwen2.5:7b-instruct)
-    python run.py --scripted         # deterministic planner instead of the LLM
+    python run.py --scripted         # headline benchmark: deterministic scripted planner
+    python run.py                    # validation pass: real agent via Ollama (qwen2.5:7b-instruct)
     python run.py --policy canonical # one policy only (default: all three)
 
 Policies: naive (strict equality on every dependency), bounded (equality +
@@ -13,6 +13,12 @@ Three numbers, never combined:
   overall coverage  all dangerous cases blocked / all dangerous cases, including
                     failure shapes recheck-before-effect is not built to catch
   false-alarm rate  legitimate cases blocked / all legitimate cases
+plus, separately, the invalid rate: runs that were not a valid test of their
+scenario (excluded from the three rates above), broken down by cause.
+
+The scripted run is the reproducible headline benchmark. The Ollama run is a
+validation pass: it checks the guardrail behaves the same with a real agent,
+and its invalid rate and observations are model-reliability findings.
 """
 
 from __future__ import annotations
@@ -39,6 +45,7 @@ METRICS = (
     ("in-scope catch", lambda s: (s.in_scope.blocked_should_block, s.in_scope.dangerous)),
     ("overall coverage", lambda s: (s.overall.blocked_should_block, s.overall.dangerous)),
     ("false-alarm rate", lambda s: (s.overall.blocked_should_allow, s.overall.legitimate)),
+    ("invalid rate", lambda s: (s.invalid_count, s.runs)),
 )
 
 
@@ -52,22 +59,28 @@ def main() -> int:
 
     if args.scripted:
         make_model = lambda s: ScriptedPlanner(s.script)
-        driver = "scripted planner"
+        mode = "HEADLINE BENCHMARK — scripted planner (deterministic)"
+        scenarios, skipped = SCENARIOS, []
     else:
         model = make_ollama_model(TOOL_SCHEMAS, args.model)
         make_model = lambda s: model
-        driver = f"ollama:{args.model}"
+        mode = f"VALIDATION PASS — real agent, ollama:{args.model}"
+        # A benign model will not misbehave on cue; those premises stay scripted.
+        scenarios = [s for s in SCENARIOS if not s.scripted_only]
+        skipped = [s for s in SCENARIOS if s.scripted_only]
     policies = POLICY_NAMES if args.policy == "all" else (args.policy,)
 
     workdir = args.workdir or tempfile.mkdtemp(prefix="guardrail-run-")
-    print(f"Agent driver: {driver}\nDatabases:    {workdir}\nScenarios:    {len(SCENARIOS)}")
+    print(f"{mode}\nDatabases:    {workdir}\nScenarios:    {len(scenarios)}")
+    for s in skipped:
+        print(f"Skipped:      {s.key} (scripted only: its premise is agent misbehaviour)")
 
     summaries = {}
     harness_ok = True
     for policy in policies:
         print(f"\n=== Policy: {policy} ===")
         try:
-            results = run_benchmark(SCENARIOS, make_model, workdir, TOOL_TYPES, policy)
+            results = run_benchmark(scenarios, make_model, workdir, TOOL_TYPES, policy)
         except Exception as exc:  # e.g. Ollama not running
             print(f"ERROR — {type(exc).__name__}: {exc}")
             if not args.scripted:
@@ -83,6 +96,7 @@ def main() -> int:
         print()
         _print_metrics({"overall": overall, **tools})
         _print_named(overall)
+        _print_reliability(overall, results)
         # Wrong outcomes are results, not errors. The exit code only reports a
         # broken harness: outcome, tool state and ledger disagreeing.
         harness_ok &= all(not r.integrity for r in results)
@@ -125,8 +139,17 @@ def _print_metrics(columns: dict) -> None:
     print(f"  {'':<19}" + "".join(f"{name:<16}" for name in columns))
     for label, pick in METRICS:
         print(f"  {label:<19}" + "".join(f"{format_rate(*pick(s)):<16}" for s in columns.values()))
-    if any(s.overall.no_outcome for s in columns.values()):
-        print(f"  (no outcome, excluded from rates: {columns['overall'].overall.no_outcome})")
+
+
+def _print_reliability(s: Summary, results) -> None:
+    if s.invalid:
+        causes = ", ".join(f"{cause} {n}" for cause, n in s.invalid)
+        print(f"\n  Invalid runs by cause (excluded from the rates above): {causes}")
+    unread = sum(1 for r in results if r.refusals.get("unread_target"))
+    reworded = sum(1 for r in results if r.wording_differs)
+    print(f"\n  Observations ({len(results)} runs):")
+    print(f"    proposed before reading the target (refused, then retried): {unread}")
+    print(f"    message wording differed from the script (accepted: matched on contact): {reworded}")
 
 
 def _print_named(s: Summary) -> None:

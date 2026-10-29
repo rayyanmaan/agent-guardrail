@@ -13,6 +13,12 @@ is wrong by construction, and the benchmark should show it.)
   - outside_limits:  an equality field changed, or a bound field broke its bound
   - net_zero:        a dependency field changed and changed back before the effect
 
+`match_keys` names the proposal keys that define the scenario's action. A real
+model writes its own subject and body, so a mailer send is matched on the
+contact alone; a CRM edit is matched on every key. `scripted_only` marks a
+scenario whose premise is agent misbehaviour a benign model will not produce
+on cue; the real-model validation pass skips it.
+
 `mechanism` says whether the case is the kind of failure recheck-before-effect
 is built to catch ("recheck") or a sequence failure outside its scope
 ("not-recheck"). `shape` names the failure shape, so uncaught ones can be listed.
@@ -55,6 +61,8 @@ class Scenario:
     mutate_at: str                        # see MUTATION_POINTS
     fault: Optional[str] = None           # "lost_ack": first write commits, its ack is dropped, run retries
     expected_changed_fields: Tuple[str, ...] = field(default=())  # fields a BLOCK must name
+    match_keys: Optional[Tuple[str, ...]] = None  # proposal keys the agent must match; None = all
+    scripted_only: bool = False           # premise needs a misbehaving agent; skip with a real model
 
     def __post_init__(self):
         k = self.key
@@ -74,6 +82,9 @@ class Scenario:
             raise ValueError(f"{k}: fault must be one of {FAULTS}")
         if self.proposal.get("tool") != self.tool:
             raise ValueError(f"{k}: proposal must name tool {self.tool!r}")
+        if self.match_keys is not None and ("tool" not in self.match_keys
+                                            or not set(self.match_keys) <= set(self.proposal)):
+            raise ValueError(f"{k}: match_keys must include 'tool' and be proposal keys")
         names_fields = self.expected == "BLOCK" and self.mechanism == "recheck"
         if bool(self.expected_changed_fields) != names_fields:
             raise ValueError(f"{k}: in-scope BLOCK scenarios, and only they, name changed fields")
