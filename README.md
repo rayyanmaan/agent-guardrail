@@ -222,6 +222,35 @@ agent ⇄ act  →  approve  →  [interrupt]  →  recheck  →  effect | block
    in one atomic statement. The CRM uses `UPDATE ... WHERE`; the mailer uses
    `INSERT ... SELECT ... WHERE`. A change that lands after the recheck is refused.
 
+### Ledger integrity
+
+The ledger (`guardrail/ledger.py`) is one SQLite table, protected three ways:
+
+- **Hash chain.** Each entry stores the previous entry's hash and its own:
+  `sha256(prev_hash + canonical JSON of the entry)`. `verify_chain()` recomputes
+  every hash in order, so an edited entry, two swapped entries or an entry
+  deleted from the middle breaks the chain. Recomputing an edited entry's own
+  hash doesn't help: the next entry still points at the old one.
+- **Triggers.** SQLite triggers abort any `UPDATE` or `DELETE` on the table, and
+  the `Ledger` class has no method that changes or removes an entry. Unknown
+  event types are rejected.
+- **No write handle for the agent.** Only the graph's guardrail nodes (approve,
+  recheck, block, effect) write to the ledger. The model's tools are reads and
+  proposals, and the tool stores never get a reference to it. This holds by
+  construction within one Python process; the operating system doesn't enforce it.
+
+What it doesn't catch: deleting the most recent entries leaves a valid chain,
+and so does rewriting every entry from an edit onward, because nothing outside
+the ledger records the latest hash.
+
+The tamper tests check that the triggers refuse `UPDATE` and `DELETE`, and,
+with the triggers dropped, that `verify_chain()` catches an edited entry, an
+edit with its hash recomputed, and a deleted middle entry. Run just those:
+
+```bash
+pytest tests/test_ledger.py
+```
+
 ### Adding a tool
 
 The skeleton (`guardrail/`, `agent/graph.py`, `scenarios/runner.py`,
