@@ -28,6 +28,10 @@ def propose_update(record_id: str, field: str, new_value: str) -> str:
     raise NotImplementedError("executed by the guardrail graph")
 
 
+def _kind(value: Any) -> str:
+    return "whole number" if isinstance(value, int) else "text"
+
+
 class CRMTool:
     name = "crm"
     target_arg = "record_id"
@@ -53,7 +57,8 @@ class CRMTool:
         field = str(args.get("field", "")).strip()
         new_value = args.get("new_value")
         if field not in EDITABLE_FIELDS:
-            return None, f"error: field must be one of {sorted(EDITABLE_FIELDS)}"
+            kinds = ", ".join(f"{f} ({_kind(decision.get(f))})" for f in sorted(EDITABLE_FIELDS))
+            return None, f"error: field must be one of: {kinds}"
         if new_value is None:
             return None, "error: new_value is required"
         # Keep the proposed value's type consistent with the column, so strict
@@ -62,7 +67,7 @@ class CRMTool:
             try:
                 new_value = int(new_value)
             except (TypeError, ValueError):
-                return None, f"error: {field} must be an integer"
+                return None, f"error: {field} must be a whole number such as 15, with no % sign or units"
         else:
             new_value = str(new_value).strip()
         return {"record_id": args["record_id"], "field": field, "new_value": new_value}, None

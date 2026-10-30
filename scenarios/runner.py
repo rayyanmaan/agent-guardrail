@@ -10,6 +10,7 @@ from __future__ import annotations
 import copy
 import os
 import uuid
+from collections import Counter
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence
 
@@ -34,6 +35,9 @@ class ScenarioResult:
     outcome: str                      # "blocked" | "allowed" | "no_proposal"
     proposal_ok: bool = True          # the agent proposed the action the scenario is about
     integrity: List[str] = field(default_factory=list)  # outcome, state and ledger disagree
+    invalid_cause: Optional[str] = None  # when proposal_ok is False, see _invalid_cause
+    refusals: Dict[str, int] = field(default_factory=dict)  # summed over attempts, see AgentState
+    wording_differs: bool = False     # matched on match_keys, but not word for word
 
     @property
     def actual(self) -> Optional[str]:
@@ -70,12 +74,15 @@ class ScenarioResult:
 
     def scored(self) -> Scored:
         s = self.scenario
-        return Scored(s.key, s.tool, s.shape, s.in_scope, s.expected, self.actual)
+        return Scored(s.key, s.tool, s.shape, s.in_scope, s.expected, self.actual,
+                      None if self.actual is not None else (self.invalid_cause or self.outcome))
 
     def line(self) -> str:
         s = self.scenario
         text = (f"  {'[' + self.verdict + ']':<22}{s.tool:<7}{s.name:<88}"
                 f"expected {s.expected}, got {self.actual or self.outcome}")
+        if self.actual is None and self.invalid_cause:
+            text += f" ({self.invalid_cause})"
         return text + "".join(f"\n         - {f}" for f in self.integrity)
 
 
@@ -91,28 +98,41 @@ def run_scenario(scenario: Scenario, make_model: ModelFactory, workdir: str,
         start = {name: t.dump() for name, t in tools.items()}
         integrity: List[str] = []
         attempts: List[str] = []
+        refusals: Counter = Counter()
+        written: List[Dict[str, Any]] = []   # actions whose effect should have landed
 
         if scenario.fault == "lost_ack":
             attempts.append(f"{slug}-{uuid.uuid4().hex[:8]}")
-            try:
-                _attempt(scenario, make_model, tools, ledger, policy, attempts[-1],
-                         {"after_write": _drop_ack})
+            first, ack_lost = _attempt(scenario, make_model, tools, ledger, policy, attempts[-1],
+                                       {"after_write": _drop_ack})
+            refusals.update(first.get("refusals") or {})
+            if not _matches(scenario, action_of(first.get("proposal"))):
+                # The model never got as far as the write; the fault was not exercised.
+                return ScenarioResult(scenario, policy, first.get("outcome") or "no_proposal", False,
+                                      [], _invalid_cause(scenario, first), dict(refusals))
+            if ack_lost:
+                written.append(_action_only(first["proposal"]))
+            else:
                 integrity.append("lost-ack fault never fired: the first attempt did not write")
-            except AckLost:
-                pass
 
         mutate = _once(lambda: _apply_mutations(scenario, tools))
         hooks = {"after_read": mutate} if scenario.mutate_at == "after_read" else \
                 {"before_write": mutate} if scenario.mutate_at == "before_write" else {}
         between = mutate if scenario.mutate_at == "after_approval" else None
         attempts.append(f"{slug}-{uuid.uuid4().hex[:8]}")
-        state = _attempt(scenario, make_model, tools, ledger, policy, attempts[-1], hooks, between)
+        state, _ = _attempt(scenario, make_model, tools, ledger, policy, attempts[-1], hooks, between)
+        refusals.update(state.get("refusals") or {})
 
         outcome = state.get("outcome") or "no_proposal"
-        proposal_ok = action_of(state.get("proposal")) == scenario.proposal
-        if proposal_ok:
-            integrity += _check(scenario, outcome, tools, start, ledger, attempts)
-        return ScenarioResult(scenario, policy, outcome, proposal_ok, integrity)
+        proposed = action_of(state.get("proposal"))
+        if not _matches(scenario, proposed):
+            return ScenarioResult(scenario, policy, outcome, False, integrity,
+                                  _invalid_cause(scenario, state), dict(refusals))
+        if outcome == "allowed":
+            written.append(_action_only(state["proposal"]))
+        integrity += _check(scenario, outcome, tools, start, ledger, attempts, written)
+        return ScenarioResult(scenario, policy, outcome, True, integrity, None, dict(refusals),
+                              wording_differs=proposed != scenario.proposal)
     finally:
         for t in tools.values():
             t.close()
@@ -128,28 +148,58 @@ def confusion_of(results: Sequence[ScenarioResult]) -> Confusion:
     return confusion((r.scenario.expected, r.actual) for r in results)
 
 
-def _attempt(scenario, make_model, tools, ledger, policy, run_id, hooks, between=None) -> dict:
+def _attempt(scenario, make_model, tools, ledger, policy, run_id, hooks, between=None):
+    """Run the graph once. Returns (final state, whether the ack was lost)."""
     graph = build_graph(make_model(scenario), list(tools.values()), ledger, policy=policy, **hooks)
     config = {"configurable": {"thread_id": run_id}}
-    # 1. Agent reads and proposes; guardrail approves, then pauses.
-    state = graph.invoke({"messages": [HumanMessage(scenario.task)], "run_id": run_id}, config)
-    if graph.get_state(config).next:
-        # 2. The world may change while the approved action waits.
-        if between is not None:
-            between()
-        # 3. Resume: recheck, then block or conditional effect.
-        state = graph.invoke(None, config)
-    return state
+    try:
+        # 1. Agent reads and proposes; guardrail approves, then pauses.
+        state = graph.invoke({"messages": [HumanMessage(scenario.task)], "run_id": run_id}, config)
+        if graph.get_state(config).next:
+            # 2. The world may change while the approved action waits.
+            if between is not None:
+                between()
+            # 3. Resume: recheck, then block or conditional effect.
+            state = graph.invoke(None, config)
+        return state, False
+    except AckLost:
+        return graph.get_state(config).values, True
+
+
+def _matches(scenario: Scenario, proposed: Optional[Dict[str, Any]]) -> bool:
+    """Did the agent propose the scenario's action, on the keys that define it?"""
+    if proposed is None:
+        return False
+    keys = scenario.match_keys or tuple(scenario.proposal)
+    return all(proposed.get(k) == scenario.proposal[k] for k in keys)
+
+
+def _invalid_cause(scenario: Scenario, state: dict) -> str:
+    """Why a run is not a valid test of its scenario.
+
+    different_action   proposed something other than the scenario's action
+    validation_format  never got a proposal past validation (bad field or value format)
+    no_proposal        never produced a proposal for any other reason
+    """
+    if state.get("proposal") is not None:
+        return "different_action"
+    if (state.get("refusals") or {}).get("invalid_args"):
+        return "validation_format"
+    return "no_proposal"
+
+
+def _action_only(proposal: Dict[str, Any]) -> Dict[str, Any]:
+    return dict(proposal["action"])
 
 
 def _check(scenario: Scenario, outcome: str, tools: Dict[str, Any], start: Dict[str, Any],
-           ledger: Ledger, attempts: List[str]) -> List[str]:
+           ledger: Ledger, attempts: List[str], written: List[Dict[str, Any]]) -> List[str]:
     failures: List[str] = []
 
     # Tool state must be exactly what the outcome implies, computed independently
-    # of the tools' own write code.
-    effects = (outcome == "allowed") + (scenario.fault == "lost_ack")
-    expected_state = _expected_state(scenario, tools, start, effects)
+    # of the tools' own write code. `written` holds the actions the agent actually
+    # proposed whose effect should have landed (a real model writes its own text).
+    expected_state = _expected_state(scenario, tools, start, written)
     for name, t in tools.items():
         actual = t.dump()
         if actual != expected_state[name]:
@@ -177,13 +227,12 @@ def _check(scenario: Scenario, outcome: str, tools: Dict[str, Any], start: Dict[
 
 
 def _expected_state(scenario: Scenario, tools: Dict[str, Any], start: Dict[str, Any],
-                    effects: int) -> Dict[str, Any]:
+                    written: List[Dict[str, Any]]) -> Dict[str, Any]:
     state = copy.deepcopy(start)
     for tool_name, target, changes in scenario.mutations:
         state[tool_name]["records"][target].update(changes)
-    action = {k: v for k, v in scenario.proposal.items() if k != "tool"}
     acting = state[scenario.tool]
-    for _ in range(effects):
+    for action in written:
         acting["effects"] += tools[scenario.tool].simulate_effect(action, acting["records"])
     return state
 

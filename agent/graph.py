@@ -68,6 +68,9 @@ class AgentState(TypedDict, total=False):
     verdict: Optional[Dict[str, Any]]    # recheck result, see guardrail.recheck.Verdict
     recheck_values: Optional[Dict[str, Any]]  # equality fields as read at recheck; the write's compare-and-set basis
     outcome: Optional[str]               # "allowed" | "blocked" | "no_proposal"
+    # How often the act node turned the model away, by kind: "unread_target"
+    # (proposed before reading), "invalid_args", "unknown_tool", "no_tool_call".
+    refusals: Dict[str, int]
     block_reason: Optional[str]
 
 
@@ -108,9 +111,15 @@ def build_graph(
     def act(state: AgentState) -> dict:
         last = state["messages"][-1]
         retries = state.get("retries", 0)
+        refusals = dict(state.get("refusals") or {})
+
+        def refuse(kind: str) -> None:
+            refusals[kind] = refusals.get(kind, 0) + 1
+
         if not isinstance(last, AIMessage) or not last.tool_calls:
+            refuse("no_tool_call")
             nudge = HumanMessage("You must respond with a tool call.")
-            return {"messages": [nudge], "retries": retries + 1}
+            return {"messages": [nudge], "retries": retries + 1, "refusals": refusals}
 
         reads = dict(state.get("reads") or {})
         replies: List[ToolMessage] = []
@@ -127,15 +136,18 @@ def build_graph(
                 if values and after_read is not None:
                     after_read()
             elif name in propose_tools and proposal is None:
-                proposal, error = _make_proposal(propose_tools[name], args, reads)
+                proposal, error, kind = _make_proposal(propose_tools[name], args, reads)
                 content = error or "proposal submitted for approval"
                 if error:
                     retries += 1
+                    refuse(kind)
             else:
                 content = f"error: unknown or repeated tool call {name!r}"
                 retries += 1
+                refuse("unknown_tool")
             replies.append(ToolMessage(content, tool_call_id=call["id"]))
-        return {"messages": replies, "reads": reads, "proposal": proposal, "retries": retries}
+        return {"messages": replies, "reads": reads, "proposal": proposal, "retries": retries,
+                "refusals": refusals}
 
     def route_after_act(state: AgentState) -> str:
         if state.get("proposal"):
@@ -253,7 +265,7 @@ def _read_key(tool: GuardedTool, target: str) -> str:
 
 
 def _make_proposal(tool: GuardedTool, args: Dict[str, Any], reads: Dict[str, Dict[str, Any]]):
-    """Return (proposal, None) or (None, error message for the model to retry on).
+    """Return (proposal, None, None), or (None, error for the model, refusal kind).
 
     The proposal carries the agent's own read of the target as its decision
     snapshot. A proposal for a target the agent never read is refused: there is
@@ -262,11 +274,12 @@ def _make_proposal(tool: GuardedTool, args: Dict[str, Any], reads: Dict[str, Dic
     target = str(args.get(tool.target_arg, "")).strip()
     decision = reads.get(_read_key(tool, target))
     if decision is None:
-        return None, f"error: call {tool.read_tool.name} for {target!r} before proposing a change to it"
+        return (None, f"error: call {tool.read_tool.name} for {target!r} before proposing a change to it",
+                "unread_target")
     action, error = tool.validate({**args, tool.target_arg: target}, decision["values"])
     if error:
-        return None, error
-    return {"tool": tool.name, "action": action, "decision": decision}, None
+        return None, error, "invalid_args"
+    return {"tool": tool.name, "action": action, "decision": decision}, None, None
 
 
 # ---- models -------------------------------------------------------------
