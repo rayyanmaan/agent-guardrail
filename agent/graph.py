@@ -3,11 +3,13 @@
 Flow:
     agent <-> act            model reads what it needs, then proposes one effect
     approve                  guardrail derives approval conditions from the
-                             agent's decision snapshot, logs approval
+                             agent's decision snapshot, mints the idempotency
+                             key, logs approval
     -- interrupt --          approval wait; the world may change here
     recheck                  guardrail re-reads, evaluates, stores verdict in state
     effect | block           routed on the stored verdict only
-    effect                   the tool's conditional effect (compare-and-set) closes TOCTOU
+    effect                   the tool's conditional effect (compare-and-set) closes TOCTOU;
+                             a key already applied is suppressed, not re-applied
 
 Tools are passed in as adapters (guardrail.tool.GuardedTool); nothing here
 knows about any particular tool.
@@ -23,6 +25,14 @@ cannot misstate what it read.
 Conditions are rebuilt from the proposal (a pure function of the action and
 the decision snapshot) wherever they are needed, rather than read back from
 state, because canonicalizers are functions. The copy in state is a record.
+
+Idempotency (guardrail/idempotency.py): the key is minted at approval from the
+plan id, tool, target, proposed change and decision snapshot, stored in state
+and in the approval entry, and passed to the effect. Retrying the same approved
+action (resuming this run after its effect committed but its acknowledgement
+was lost) carries the same key, so the store recognises it and the effect does
+not fire twice. A separately approved action has a different plan id, so a
+legitimate repeat is not suppressed. Nothing the model emits goes into the key.
 
 Replay safety: the live re-read happens inside the `recheck` node and its result
 is written to state. The branch after it reads only `state["verdict"]`, never
@@ -43,6 +53,7 @@ from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
 
+from guardrail.idempotency import intent_key
 from guardrail.ledger import Ledger
 from guardrail.policy import POLICIES
 from guardrail.recheck import Condition, evaluate, take_snapshot
@@ -61,13 +72,16 @@ SYSTEM_PROMPT = (
 class AgentState(TypedDict, total=False):
     messages: Annotated[List[AnyMessage], add_messages]
     run_id: str
+    plan_id: str                         # the approved plan this run executes; defaults to run_id
     retries: int
     reads: Dict[str, Dict[str, Any]]     # "tool:target" -> {"values", "read_at"}: what the agent saw
     proposal: Optional[Dict[str, Any]]   # {tool, action, decision: {values, read_at}}
     conditions: Optional[List[Dict[str, Any]]]  # approval basis, as Condition.to_dict()
     verdict: Optional[Dict[str, Any]]    # recheck result, see guardrail.recheck.Verdict
     recheck_values: Optional[Dict[str, Any]]  # equality fields as read at recheck; the write's compare-and-set basis
-    outcome: Optional[str]               # "allowed" | "blocked" | "no_proposal"
+    idempotency_key: Optional[str]       # minted at approval from the approved intent
+    effect_result: Optional[Dict[str, Any]]  # when a duplicate is suppressed, the original effect
+    outcome: Optional[str]               # "allowed" | "blocked" | "deduplicated" | "no_proposal"
     # How often the act node turned the model away, by kind: "unread_target"
     # (proposed before reading), "invalid_args", "unknown_tool", "no_tool_call".
     refusals: Dict[str, int]
@@ -168,17 +182,22 @@ def build_graph(
 
     def approve(state: AgentState) -> dict:
         p = state["proposal"]
-        deps = by_name[p["tool"]].dependencies(p["action"])
+        tool = by_name[p["tool"]]
+        deps = tool.dependencies(p["action"])
         decision = p["decision"]
         conditions = conditions_for(p)
+        snapshot = take_snapshot(decision["values"], [d.field for d in deps])
+        key = intent_key(state.get("plan_id") or state["run_id"], tool.name,
+                         p["action"][tool.target_arg], p["action"], snapshot)
         ledger.append(state["run_id"], "approval", {
             "proposal": action_of(p),
             "policy": policy,
             "decision_read_at": decision["read_at"],
-            "decision_snapshot": take_snapshot(decision["values"], [d.field for d in deps]),
+            "decision_snapshot": snapshot,
             "conditions": [c.to_dict() for c in conditions],
+            "idempotency_key": key,
         })
-        return {"conditions": [c.to_dict() for c in conditions]}
+        return {"conditions": [c.to_dict() for c in conditions], "idempotency_key": key}
 
     def recheck(state: AgentState) -> dict:
         p = state["proposal"]
@@ -216,15 +235,24 @@ def build_graph(
         # equivalent value (e.g. a lowercased address), and the write must not
         # re-reject what the recheck accepted. Either way any change after the
         # recheck, even an equivalent one, is refused: the write stays exact.
+        key = state["idempotency_key"]
         result = tool.apply(
             p["action"],
             expected=state["recheck_values"],
             bounds=[(c.field, c.op, c.value) for c in conditions if c.op != "=="],
+            idempotency_key=key,
         )
+        if result.duplicate:
+            # This approved action already took effect (e.g. a retry after its
+            # acknowledgement was lost). Return the original; do not apply twice.
+            ledger.append(state["run_id"], "duplicate_suppressed", {
+                "proposal": action_of(p), "idempotency_key": key, "original": result.original})
+            return {"outcome": "deduplicated", "effect_result": result.original}
         if result.written:
             if after_write is not None:
                 after_write()
-            ledger.append(state["run_id"], "allow", {"proposal": action_of(p), "write": result.reason})
+            ledger.append(state["run_id"], "allow", {"proposal": action_of(p), "write": result.reason,
+                                                    "idempotency_key": key})
             return {"outcome": "allowed"}
         # Recheck passed but the compare-and-set did not: something changed in
         # the window between recheck and write. Re-read only to say which field

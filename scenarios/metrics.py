@@ -87,15 +87,16 @@ class Scored:
     key: str
     tool: str
     shape: str
-    in_scope: bool            # the failure shape is one the recheck mechanism is built to catch
+    in_scope: bool            # some guardrail mechanism is built to catch this failure shape
     expected: str             # "BLOCK" | "ALLOW"
     actual: Optional[str]     # "BLOCK" | "ALLOW" | None (no valid outcome)
     invalid_cause: Optional[str] = None  # why actual is None, e.g. "validation_format"
+    mechanism: Optional[str] = None      # "recheck" | "idempotency" | "none", see scenarios.base
 
 
 @dataclass(frozen=True)
 class Summary:
-    in_scope: Confusion             # recheck-mechanism scenarios only
+    in_scope: Confusion             # scenarios some mechanism is built to catch
     overall: Confusion              # every scenario
     uncaught: Tuple[Scored, ...]    # should BLOCK, was allowed
     false_alarms: Tuple[Scored, ...]  # should ALLOW, was blocked
@@ -114,7 +115,7 @@ class Summary:
 
     @property
     def in_scope_catch_rate(self) -> Optional[float]:
-        """The fair measure of the mechanism: stale-facts cases blocked."""
+        """The fair measure of the mechanisms: dangerous cases they are built for, blocked."""
         return self.in_scope.catch_rate
 
     @property
@@ -143,3 +144,14 @@ def by_tool(rows: Iterable[Scored]) -> Dict[str, Summary]:
     rows = list(rows)
     return {tool: summarize(r for r in rows if r.tool == tool)
             for tool in sorted({r.tool for r in rows})}
+
+
+MECHANISM_ORDER = ("recheck", "idempotency", "none")
+
+
+def by_mechanism(rows: Iterable[Scored]) -> Dict[str, Summary]:
+    """One summary per mechanism, so it is clear which check covers which failure."""
+    rows = list(rows)
+    present = {r.mechanism for r in rows}
+    return {m: summarize(r for r in rows if r.mechanism == m)
+            for m in sorted(present, key=lambda m: (MECHANISM_ORDER + (m,)).index(m))}

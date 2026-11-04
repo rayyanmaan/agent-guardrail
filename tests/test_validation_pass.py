@@ -39,10 +39,10 @@ def test_reworded_send_is_a_valid_run(key, verdict, tmp_path):
     assert (r.verdict, r.wording_differs) == (verdict, True), r.failures
 
 
-def test_lost_ack_duplicate_checked_against_the_agents_own_wording(tmp_path):
+def test_lost_ack_retry_checked_against_the_agents_own_wording(tmp_path):
     r = run(reworded("mailer_lost_ack_retry"), tmp_path)
-    # Integrity passing means the outbox holds two sends with the agent's text.
-    assert r.verdict == "MISS (out of scope)" and not r.integrity
+    # Integrity passing means the outbox holds one send, with the agent's text.
+    assert r.verdict == "PASS" and r.outcome == "deduplicated" and not r.integrity
 
 
 def test_send_to_a_different_contact_is_invalid(tmp_path):

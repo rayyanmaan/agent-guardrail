@@ -1,8 +1,8 @@
 """Labelled CRM scenarios.
 
 SCENARIOS is the original set (5 BLOCK, 5 ALLOW), written together with the
-bounded policy. HARDER_SCENARIOS were added later, with each expected
-outcome decided before running the policy on it.
+bounded policy. HARDER_SCENARIOS and then IDEMPOTENCY_SCENARIOS were added
+later, each with its expected outcome decided before running the policy on it.
 
 Plan upgrade (C-1001 starter -> growth) depends on:
   plan   == starter  (equality: the value being overwritten)
@@ -163,3 +163,32 @@ HARDER_SCENARIOS = [
     SEATS_AT_CAP_PLUS_NOTES, DISCOUNT_TWO_BOUNDS_WITHIN, STATUS_NET_ZERO, PLAN_ALREADY_TARGET,
     DISCOUNT_BALANCE_OVER,
 ]
+
+# ---- Idempotency ----------------------------------------------------------------
+# Neither case involves a dependency that changed while the action waited.
+
+# The upgrade commits, its acknowledgement is lost, and the same approved
+# upgrade is retried. The upgrade must take effect once: one applied change,
+# not two (a second one would, say, bill the upgrade twice). Without a key the
+# retry is still refused here, because the plan field it overwrites has moved,
+# but it is refused as "stale", which misreports what happened and does not
+# return the original result. The key recognises it as already applied.
+CRM_LOST_ACK_RETRY = Scenario(
+    key="crm_lost_ack_retry", name="CRM: update commits, ack is lost, the approved update is retried",
+    tool="crm", expected="BLOCK", mechanism="idempotency", shape="lost_ack_retry", label=None,
+    seed={"crm": (SEED,)}, task=TASK, script=edit_script(**UPGRADE),
+    proposal={"tool": "crm", **UPGRADE}, mutations=(), mutate_at="none", fault="lost_ack")
+
+# Legitimate. An earlier plan upgraded the customer; billing then reverted the
+# account to starter, and a new, separately approved plan upgrades it again.
+# Same tool, target, change and decision snapshot as the earlier plan: only
+# the plan differs. It must go through, not be suppressed as a duplicate.
+CRM_REUPGRADE_NEW_PLAN = Scenario(
+    key="crm_reupgrade_new_plan",
+    name="CRM: same upgrade approved again in a new plan, after billing reverted it",
+    tool="crm", expected="ALLOW", mechanism="idempotency", shape="legitimate_repeat", label=None,
+    seed={"crm": (SEED,)}, task=TASK, script=edit_script(**UPGRADE),
+    proposal={"tool": "crm", **UPGRADE}, mutations=(("crm", "C-1001", {"plan": "starter"}),),
+    mutate_at="between_plans", fault="repeat_plan")
+
+IDEMPOTENCY_SCENARIOS = [CRM_LOST_ACK_RETRY, CRM_REUPGRADE_NEW_PLAN]

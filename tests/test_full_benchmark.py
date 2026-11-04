@@ -3,12 +3,17 @@
 The pinned outcomes were predicted before the harder scenarios were first
 run. If a change moves them, that is a real change in what the guardrail does
 and should be reported, not absorbed by editing these numbers.
+
+These pins stay on the original 23 scenarios. Adding idempotency changed one
+of them on purpose: idempotency now catches the lost-ack retry, so it moved
+from uncaught to caught (and counts as in scope). The full 26 are pinned in
+test_idempotency.py.
 """
 
 import pytest
 
 from agent.graph import ScriptedPlanner
-from scenarios.benchmark import SCENARIOS
+from scenarios.benchmark import ORIGINAL_BENCHMARK as SCENARIOS
 from scenarios.metrics import Scored, by_tool, summarize
 from scenarios.runner import run_benchmark
 from tools.registry import TOOL_TYPES
@@ -68,7 +73,7 @@ def test_benchmark_shape():
     expected = [s.expected for s in SCENARIOS]
     assert {s.tool for s in SCENARIOS} == {"crm", "mailer"}
     assert (expected.count("BLOCK"), expected.count("ALLOW")) == (11, 12)
-    assert {s.shape for s in SCENARIOS if not s.in_scope} == {"lost_ack_retry", "disclosure_by_combination"}
+    assert {s.shape for s in SCENARIOS if not s.in_scope} == {"disclosure_by_combination"}
 
 
 def test_harness_integrity_holds_under_both_policies(results):
@@ -79,9 +84,9 @@ def test_harness_integrity_holds_under_both_policies(results):
 
 def test_bounded_policy_numbers(results):
     s = summarize(r.scored() for r in results["bounded"])
-    assert (s.in_scope.blocked_should_block, s.in_scope.dangerous) == (9, 9)
-    assert (s.overall.blocked_should_block, s.overall.dangerous) == (9, 11)
-    assert {r.shape for r in s.uncaught} == {"lost_ack_retry", "disclosure_by_combination"}
+    assert (s.in_scope.blocked_should_block, s.in_scope.dangerous) == (10, 10)
+    assert (s.overall.blocked_should_block, s.overall.dangerous) == (10, 11)
+    assert {r.shape for r in s.uncaught} == {"disclosure_by_combination"}
     assert (s.overall.blocked_should_allow, s.overall.legitimate) == (2, 12)
     assert {r.key for r in s.false_alarms} == {"plan_already_target", "mailer_email_case"}
 
@@ -98,7 +103,7 @@ def test_naive_baseline_numbers(results):
     assert naive_mailer == bounded_mailer
 
 
-def test_lost_ack_retry_really_duplicates(results):
+def test_lost_ack_retry_is_deduplicated(results):
     r = next(r for r in results["bounded"] if r.scenario.key == "mailer_lost_ack_retry")
-    # Integrity passing here means the outbox holds exactly two identical sends.
-    assert r.outcome == "allowed" and not r.integrity
+    # Integrity passing here means the outbox holds exactly one send.
+    assert r.outcome == "deduplicated" and not r.integrity

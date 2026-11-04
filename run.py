@@ -8,13 +8,18 @@ Policies: naive (strict equality on every dependency), bounded (equality +
 bounds, strict comparison), canonical (bounded + per-field canonicalization and
 target convergence on equality fields).
 
+Two mechanisms: recheck-before-effect (a fact the action depends on changed)
+and idempotency (a retry of an action that already took effect). Idempotency
+is an effect-level check, so it applies under every policy.
+
 Three numbers, never combined:
-  in-scope catch    stale-facts cases blocked / all stale-facts cases
+  in-scope catch    dangerous cases some mechanism is built for, blocked / all of them
   overall coverage  all dangerous cases blocked / all dangerous cases, including
-                    failure shapes recheck-before-effect is not built to catch
+                    failure shapes no mechanism here is built to catch
   false-alarm rate  legitimate cases blocked / all legitimate cases
-plus, separately, the invalid rate: runs that were not a valid test of their
-scenario (excluded from the three rates above), broken down by cause.
+each also broken down by tool and by mechanism; plus, separately, the invalid
+rate: runs that were not a valid test of their scenario (excluded from the
+three rates above), broken down by cause.
 
 The scripted run is the reproducible headline benchmark. The Ollama run is a
 validation pass: it checks the guardrail behaves the same with a real agent,
@@ -36,7 +41,8 @@ warnings.filterwarnings("ignore", message=".*allowed_objects.*")
 
 from agent.graph import ScriptedPlanner, make_ollama_model  # noqa: E402
 from scenarios.benchmark import SCENARIOS  # noqa: E402
-from scenarios.metrics import Summary, by_tool, format_rate, format_table, summarize  # noqa: E402
+from scenarios.metrics import (Summary, by_mechanism, by_tool, format_rate, format_table,  # noqa: E402
+                               summarize)
 from scenarios.runner import run_benchmark  # noqa: E402
 from tools.registry import TOOL_SCHEMAS, TOOL_TYPES  # noqa: E402
 
@@ -76,6 +82,7 @@ def main() -> int:
         print(f"Skipped:      {s.key} (scripted only: its premise is agent misbehaviour)")
 
     summaries = {}
+    mechanism_summaries = {}
     harness_ok = True
     for policy in policies:
         print(f"\n=== Policy: {policy} ===")
@@ -89,12 +96,15 @@ def main() -> int:
         for r in results:
             print(r.line())
         rows = [r.scored() for r in results]
-        overall, tools = summarize(rows), by_tool(rows)
+        overall, tools, mechanisms = summarize(rows), by_tool(rows), by_mechanism(rows)
         summaries[policy] = (overall, tools)
+        mechanism_summaries[policy] = mechanisms
         print()
         print(format_table(overall.overall))
         print()
         _print_metrics({"overall": overall, **tools})
+        print()
+        _print_by_mechanism(mechanisms)
         _print_named(overall)
         _print_reliability(overall, results)
         # Wrong outcomes are results, not errors. The exit code only reports a
@@ -113,6 +123,15 @@ def main() -> int:
                     s = overall if scope == "overall" else tools[scope]
                     cells.append(format_rate(*pick(s)))
                 print(f"  {label:<19}{scope:<10}" + "".join(f"{c:<16}" for c in cells))
+
+    if len(summaries) > 1:
+        print("\n=== Coverage by mechanism ===")
+        print(f"  {'':<19}{'mechanism':<13}" + "".join(f"{p:<16}" for p in policies))
+        for label, pick in (("catch", lambda s: (s.overall.blocked_should_block, s.overall.dangerous)),
+                            ("false alarms", lambda s: (s.overall.blocked_should_allow, s.overall.legitimate))):
+            for m in mechanism_summaries[policies[0]]:
+                cells = [format_rate(*pick(mechanism_summaries[p][m])) for p in policies]
+                print(f"  {label:<19}{m:<13}" + "".join(f"{c:<16}" for c in cells))
 
     if "bounded" in summaries and "canonical" in summaries:
         print("\n=== False-alarm rate before / after canonicalization ===")
@@ -141,6 +160,13 @@ def _print_metrics(columns: dict) -> None:
         print(f"  {label:<19}" + "".join(f"{format_rate(*pick(s)):<16}" for s in columns.values()))
 
 
+def _print_by_mechanism(mechanisms: dict) -> None:
+    print(f"  {'by mechanism':<19}{'catch':<16}{'false alarms':<16}")
+    for m, s in mechanisms.items():
+        print(f"  {m:<19}{format_rate(s.overall.blocked_should_block, s.overall.dangerous):<16}"
+              f"{format_rate(s.overall.blocked_should_allow, s.overall.legitimate):<16}")
+
+
 def _print_reliability(s: Summary, results) -> None:
     if s.invalid:
         causes = ", ".join(f"{cause} {n}" for cause, n in s.invalid)
@@ -156,7 +182,7 @@ def _print_named(s: Summary) -> None:
     if s.uncaught:
         print("\n  Uncaught dangerous cases:")
         for r in s.uncaught:
-            scope = "in scope" if r.in_scope else "outside the recheck mechanism"
+            scope = f"mechanism: {r.mechanism}" if r.in_scope else "no mechanism here covers it"
             print(f"    - {r.shape} ({r.tool}, {r.key}) — {scope}")
     if s.false_alarms:
         print("\n  False alarms (legitimate cases blocked):")

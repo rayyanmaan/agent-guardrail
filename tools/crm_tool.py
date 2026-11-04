@@ -79,9 +79,10 @@ class CRMTool:
         return {action["field"]: action["new_value"]}
 
     def apply(self, action: Dict[str, Any], expected: Dict[str, Any],
-              bounds: Sequence[Tuple[str, str, Any]]) -> UpdateResult:
+              bounds: Sequence[Tuple[str, str, Any]], idempotency_key: str) -> UpdateResult:
         return self.crm.conditional_update(
-            action["record_id"], expected, {action["field"]: action["new_value"]}, bounds)
+            action["record_id"], expected, {action["field"]: action["new_value"]}, bounds,
+            idempotency_key=idempotency_key)
 
     # ---- scenario harness ---------------------------------------------------
 
@@ -93,10 +94,12 @@ class CRMTool:
         self.crm.mutate_out_of_band(target, **changes)
 
     def dump(self) -> Dict[str, Any]:
-        return {"records": {r["id"]: r for r in self.crm.read_all()}, "effects": []}
+        return {"records": {r["id"]: r for r in self.crm.read_all()},
+                "effects": self.crm.applied_changes()}
 
     @staticmethod
     def simulate_effect(action: Dict[str, Any], records: Dict[str, Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """What the effect should do, as plain dict operations. Edits `records` in place."""
+        """What the effect should do, as plain dict operations: set the field
+        (editing `records` in place) and log one applied change."""
         records[action["record_id"]][action["field"]] = action["new_value"]
-        return []
+        return [{"record_id": action["record_id"], "changes": {action["field"]: action["new_value"]}}]

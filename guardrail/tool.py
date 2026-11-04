@@ -3,7 +3,8 @@
 The skeleton (graph, recheck, policy, ledger) never imports a tool. Each tool
 hands it an adapter with this shape. Writing one is the whole cost of adding a
 tool: a read, a validation of the model's arguments, a dependency set, and a
-conditional effect that refuses to fire if the approved conditions no longer hold.
+conditional effect that refuses to fire if the approved conditions no longer hold,
+or if its idempotency key was already applied.
 """
 
 from __future__ import annotations
@@ -18,6 +19,8 @@ from guardrail.policy import Dependency
 class EffectResult(Protocol):
     written: bool
     reason: str
+    duplicate: bool                   # the idempotency key was already applied; nothing written
+    original: Optional[Dict[str, Any]]  # when duplicate, the effect recorded under that key
 
 
 class GuardedTool(Protocol):
@@ -49,6 +52,8 @@ class GuardedTool(Protocol):
         """
 
     def apply(self, action: Dict[str, Any], expected: Dict[str, Any],
-              bounds: Sequence[Tuple[str, str, Any]]) -> EffectResult:
+              bounds: Sequence[Tuple[str, str, Any]], idempotency_key: str) -> EffectResult:
         """Perform the effect only if every expected value and bound still holds,
-        checked and written atomically."""
+        checked and written atomically, and record `idempotency_key` with it in
+        the same transaction (UNIQUE). If the key was already applied, write
+        nothing and return duplicate=True with the original effect."""

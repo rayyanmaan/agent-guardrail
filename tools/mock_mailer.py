@@ -2,7 +2,9 @@
 
 This module knows nothing about the guardrail or the ledger. It exposes:
   - read_contact:        what the agent (and the guardrail's recheck) sees
-  - conditional_send:    compare-and-set send, the only way a message lands in the outbox
+  - conditional_send:    compare-and-set send, the only way a message lands in the outbox.
+                         Each outbox row carries its idempotency key (UNIQUE), so a
+                         retry of an already-sent message is recognised, not re-sent.
   - mutate_out_of_band:  simulates a separate process changing a contact
 """
 
@@ -21,6 +23,8 @@ BOUND_OPS = ("<=", ">=")
 class SendResult:
     written: bool
     reason: str
+    duplicate: bool = False                    # key already sent; nothing written
+    original: Optional[Dict[str, Any]] = None  # when duplicate, the outbox row under the key
 
 
 class MockMailer:
@@ -36,6 +40,7 @@ class MockMailer:
             );
             CREATE TABLE IF NOT EXISTS outbox (
                 seq INTEGER PRIMARY KEY AUTOINCREMENT,
+                idempotency_key TEXT NOT NULL UNIQUE,
                 contact_id TEXT NOT NULL, to_email TEXT NOT NULL,
                 subject TEXT NOT NULL, body TEXT NOT NULL
             );
@@ -73,31 +78,57 @@ class MockMailer:
         subject: str,
         body: str,
         bounds: Sequence[Tuple[str, str, Any]] = (),
+        *,
+        idempotency_key: str,
     ) -> SendResult:
         """Queue a message only if the contact still matches `expected` and `bounds`.
 
         One INSERT ... SELECT: the address is taken from the contact row in the
         same statement that checks it, so the check and the send cannot be split.
+
+        If `idempotency_key` was already sent, nothing is queued and the original
+        outbox row is returned (duplicate=True). The key is checked before the
+        conditions, so a retry is reported as already sent even if the contact
+        has since changed. The key is a column of the outbox row itself, so the
+        send and its key land together, and the UNIQUE constraint is the final
+        gate if the lookup is ever bypassed.
         """
+        if not idempotency_key:
+            raise ValueError("conditional_send requires an idempotency key")
         if not expected and not bounds:
             raise ValueError("conditional_send requires a non-empty expected snapshot or bounds")
         _check_fields(expected)
         _check_fields({col: None for col, _, _ in bounds})
         if any(op not in BOUND_OPS for _, op, _ in bounds):
             raise ValueError(f"bound operators must be one of {BOUND_OPS}")
+        original = self._sent(idempotency_key)
+        if original is not None:
+            return SendResult(False, "duplicate: already sent", duplicate=True, original=original)
         where_sql = " AND ".join(
             [f"{col} IS ?" for col in expected] + [f"{col} {op} ?" for col, op, _ in bounds])
-        cur = self._conn.execute(
-            "INSERT INTO outbox (contact_id, to_email, subject, body)"
-            f" SELECT id, recipient_email, ?, ? FROM contacts WHERE id = ? AND {where_sql}",
-            (subject, body, contact_id, *expected.values(), *(limit for _, _, limit in bounds)),
-        )
-        self._conn.commit()
+        try:
+            cur = self._conn.execute(
+                "INSERT INTO outbox (idempotency_key, contact_id, to_email, subject, body)"
+                f" SELECT ?, id, recipient_email, ?, ? FROM contacts WHERE id = ? AND {where_sql}",
+                (idempotency_key, subject, body, contact_id, *expected.values(),
+                 *(limit for _, _, limit in bounds)),
+            )
+            self._conn.commit()
+        except sqlite3.IntegrityError:
+            self._conn.rollback()
+            return SendResult(False, "duplicate: already sent", duplicate=True,
+                              original=self._sent(idempotency_key))
         if cur.rowcount == 1:
             return SendResult(written=True, reason="queued")
         if self.read_contact(contact_id) is None:
             return SendResult(written=False, reason="no such contact")
         return SendResult(written=False, reason="stale: contact no longer matches snapshot")
+
+    def _sent(self, idempotency_key: str) -> Optional[Dict[str, Any]]:
+        row = self._conn.execute(
+            "SELECT contact_id, to_email, subject, body FROM outbox WHERE idempotency_key = ?",
+            (idempotency_key,)).fetchone()
+        return dict(row) if row else None
 
     def mutate_out_of_band(self, contact_id: str, **changes: Any) -> None:
         """Simulate another process editing the contact, via its own connection."""

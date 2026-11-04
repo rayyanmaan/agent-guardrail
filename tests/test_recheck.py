@@ -67,21 +67,22 @@ def crm(tmp_path):
 def test_conditional_update_refuses_stale_row(crm):
     snap = {"plan": "starter", "status": "active"}
     crm.mutate_out_of_band("C-1001", status="cancelled")
-    result = crm.conditional_update("C-1001", snap, {"plan": "growth"})
+    result = crm.conditional_update("C-1001", snap, {"plan": "growth"}, idempotency_key="k1")
     assert not result.written
     assert crm.read_record("C-1001")["plan"] == "starter"
 
 
 def test_conditional_update_ignores_unrelated_drift(crm):
     crm.mutate_out_of_band("C-1001", notes="changed")
-    result = crm.conditional_update("C-1001", {"plan": "starter", "status": "active"}, {"plan": "growth"})
+    result = crm.conditional_update("C-1001", {"plan": "starter", "status": "active"}, {"plan": "growth"},
+                                    idempotency_key="k1")
     assert result.written
     assert crm.read_record("C-1001") == {**RECORD, "notes": "changed", "plan": "growth"}
 
 
 def test_conditional_update_requires_snapshot(crm):
     with pytest.raises(ValueError):
-        crm.conditional_update("C-1001", {}, {"plan": "growth"})
+        crm.conditional_update("C-1001", {}, {"plan": "growth"}, idempotency_key="k1")
 
 
 def test_toctou_change_between_recheck_and_write_is_refused(crm, tmp_path):

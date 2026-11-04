@@ -110,9 +110,11 @@ def test_unknown_target_plan_fails_closed():
 def test_conditional_update_enforces_bounds(crm):
     expected = {"plan": "starter", "status": "active"}
     crm.mutate_out_of_band("C-1001", seats=21)
-    assert not crm.conditional_update("C-1001", expected, {"plan": "growth"}, [("seats", "<=", 20)]).written
+    assert not crm.conditional_update("C-1001", expected, {"plan": "growth"}, [("seats", "<=", 20)],
+                                      idempotency_key="k1").written
     crm.mutate_out_of_band("C-1001", seats=20)
-    assert crm.conditional_update("C-1001", expected, {"plan": "growth"}, [("seats", "<=", 20)]).written
+    assert crm.conditional_update("C-1001", expected, {"plan": "growth"}, [("seats", "<=", 20)],
+                                  idempotency_key="k2").written
 
 
 # ---- metrics ----------------------------------------------------------------

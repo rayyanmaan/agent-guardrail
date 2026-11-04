@@ -23,7 +23,9 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 GENESIS_HASH = "0" * 64
-EVENT_TYPES = frozenset({"approval", "recheck", "allow", "block"})
+# duplicate_suppressed: a retry of an already-applied action was refused by its
+# idempotency key (see guardrail/idempotency.py).
+EVENT_TYPES = frozenset({"approval", "recheck", "allow", "block", "duplicate_suppressed"})
 
 
 class Ledger:

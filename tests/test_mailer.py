@@ -47,7 +47,7 @@ EXPECTED = {"recipient_email": "dana@acme.example", "opt_in_status": "opted_in"}
 
 
 def test_send_goes_to_the_checked_address(mailer):
-    assert mailer.conditional_send("M-2001", EXPECTED, "s", "b").written
+    assert mailer.conditional_send("M-2001", EXPECTED, "s", "b", idempotency_key="k1").written
     assert mailer.outbox() == [{"contact_id": "M-2001", "to_email": "dana@acme.example",
                                 "subject": "s", "body": "b"}]
 
@@ -55,14 +55,14 @@ def test_send_goes_to_the_checked_address(mailer):
 @pytest.mark.parametrize("change", [{"recipient_email": "ops@acme.example"}, {"opt_in_status": "opted_out"}])
 def test_send_refused_when_a_dependency_moved(mailer, change):
     mailer.mutate_out_of_band("M-2001", **change)
-    result = mailer.conditional_send("M-2001", EXPECTED, "s", "b")
+    result = mailer.conditional_send("M-2001", EXPECTED, "s", "b", idempotency_key="k1")
     assert not result.written and result.reason.startswith("stale")
     assert mailer.outbox() == []
 
 
 def test_send_requires_conditions(mailer):
     with pytest.raises(ValueError):
-        mailer.conditional_send("M-2001", {}, "s", "b")
+        mailer.conditional_send("M-2001", {}, "s", "b", idempotency_key="k1")
 
 
 # ---- through the unchanged skeleton -------------------------------------------

@@ -32,7 +32,7 @@ class AckLost(Exception):
 class ScenarioResult:
     scenario: Scenario
     policy: str
-    outcome: str                      # "blocked" | "allowed" | "no_proposal"
+    outcome: str                      # "blocked" | "allowed" | "deduplicated" | "no_proposal"
     proposal_ok: bool = True          # the agent proposed the action the scenario is about
     integrity: List[str] = field(default_factory=list)  # outcome, state and ledger disagree
     invalid_cause: Optional[str] = None  # when proposal_ok is False, see _invalid_cause
@@ -41,10 +41,13 @@ class ScenarioResult:
 
     @property
     def actual(self) -> Optional[str]:
-        """BLOCK / ALLOW, or None if this run is not a valid test of the scenario."""
+        """BLOCK / ALLOW, or None if this run is not a valid test of the scenario.
+
+        A suppressed duplicate counts as BLOCK: the second effect did not happen.
+        """
         if not self.proposal_ok:
             return None
-        return {"blocked": "BLOCK", "allowed": "ALLOW"}.get(self.outcome)
+        return {"blocked": "BLOCK", "allowed": "ALLOW", "deduplicated": "BLOCK"}.get(self.outcome)
 
     @property
     def passed(self) -> bool:
@@ -75,7 +78,8 @@ class ScenarioResult:
     def scored(self) -> Scored:
         s = self.scenario
         return Scored(s.key, s.tool, s.shape, s.in_scope, s.expected, self.actual,
-                      None if self.actual is not None else (self.invalid_cause or self.outcome))
+                      None if self.actual is not None else (self.invalid_cause or self.outcome),
+                      s.mechanism)
 
     def line(self) -> str:
         s = self.scenario
@@ -97,40 +101,48 @@ def run_scenario(scenario: Scenario, make_model: ModelFactory, workdir: str,
             tools[name].seed(rows)
         start = {name: t.dump() for name, t in tools.items()}
         integrity: List[str] = []
-        attempts: List[str] = []
+        attempts: List[str] = []             # one run id per plan; each run is its own plan
         refusals: Counter = Counter()
-        written: List[Dict[str, Any]] = []   # actions whose effect should have landed
+        earlier: List[Dict[str, Any]] = []   # effects that landed before the mutations
+        written: List[Dict[str, Any]] = []   # effects that landed after them
 
-        if scenario.fault == "lost_ack":
-            attempts.append(f"{slug}-{uuid.uuid4().hex[:8]}")
-            first, ack_lost = _attempt(scenario, make_model, tools, ledger, policy, attempts[-1],
-                                       {"after_write": _drop_ack})
+        if scenario.fault == "repeat_plan":
+            # The same action, approved and applied in an earlier, separate plan.
+            attempts.append(_new_run_id(slug))
+            first, _ = _attempt(scenario, make_model, tools, ledger, policy, attempts[-1], {})
             refusals.update(first.get("refusals") or {})
             if not _matches(scenario, action_of(first.get("proposal"))):
-                # The model never got as far as the write; the fault was not exercised.
                 return ScenarioResult(scenario, policy, first.get("outcome") or "no_proposal", False,
                                       [], _invalid_cause(scenario, first), dict(refusals))
-            if ack_lost:
-                written.append(_action_only(first["proposal"]))
+            if first.get("outcome") == "allowed":
+                earlier.append(_action_only(first["proposal"]))
             else:
-                integrity.append("lost-ack fault never fired: the first attempt did not write")
+                integrity.append(f"earlier plan was {first.get('outcome')!r}, expected 'allowed'")
+            _apply_mutations(scenario, tools)
 
         mutate = _once(lambda: _apply_mutations(scenario, tools))
         hooks = {"after_read": mutate} if scenario.mutate_at == "after_read" else \
                 {"before_write": mutate} if scenario.mutate_at == "before_write" else {}
+        if scenario.fault == "lost_ack":
+            hooks["after_write"] = _once(_drop_ack)
         between = mutate if scenario.mutate_at == "after_approval" else None
-        attempts.append(f"{slug}-{uuid.uuid4().hex[:8]}")
-        state, _ = _attempt(scenario, make_model, tools, ledger, policy, attempts[-1], hooks, between)
+        attempts.append(_new_run_id(slug))
+        state, ack_lost = _attempt(scenario, make_model, tools, ledger, policy, attempts[-1], hooks, between)
         refusals.update(state.get("refusals") or {})
 
         outcome = state.get("outcome") or "no_proposal"
         proposed = action_of(state.get("proposal"))
         if not _matches(scenario, proposed):
+            # For lost_ack this also means the model never got as far as the write.
             return ScenarioResult(scenario, policy, outcome, False, integrity,
                                   _invalid_cause(scenario, state), dict(refusals))
+        if ack_lost:
+            written.append(_action_only(state["proposal"]))   # the first write committed
+        elif scenario.fault == "lost_ack":
+            integrity.append("lost-ack fault never fired: the first write did not commit")
         if outcome == "allowed":
             written.append(_action_only(state["proposal"]))
-        integrity += _check(scenario, outcome, tools, start, ledger, attempts, written)
+        integrity += _check(scenario, outcome, tools, start, ledger, attempts, earlier, written)
         return ScenarioResult(scenario, policy, outcome, True, integrity, None, dict(refusals),
                               wording_differs=proposed != scenario.proposal)
     finally:
@@ -149,21 +161,29 @@ def confusion_of(results: Sequence[ScenarioResult]) -> Confusion:
 
 
 def _attempt(scenario, make_model, tools, ledger, policy, run_id, hooks, between=None):
-    """Run the graph once. Returns (final state, whether the ack was lost)."""
+    """Run one plan through the graph. Returns (final state, whether an ack was lost).
+
+    If the effect's acknowledgement is lost, the same approved action is
+    retried: the run resumes from its last checkpoint, which re-runs the effect
+    with the state approval left behind, idempotency key included. The model is
+    not consulted again.
+    """
     graph = build_graph(make_model(scenario), list(tools.values()), ledger, policy=policy, **hooks)
     config = {"configurable": {"thread_id": run_id}}
-    try:
-        # 1. Agent reads and proposes; guardrail approves, then pauses.
-        state = graph.invoke({"messages": [HumanMessage(scenario.task)], "run_id": run_id}, config)
-        if graph.get_state(config).next:
-            # 2. The world may change while the approved action waits.
-            if between is not None:
-                between()
-            # 3. Resume: recheck, then block or conditional effect.
-            state = graph.invoke(None, config)
+    # 1. Agent reads and proposes; guardrail approves, then pauses.
+    state = graph.invoke({"messages": [HumanMessage(scenario.task)], "run_id": run_id,
+                          "plan_id": run_id}, config)
+    if not graph.get_state(config).next:
         return state, False
+    # 2. The world may change while the approved action waits.
+    if between is not None:
+        between()
+    # 3. Resume: recheck, then block or conditional effect.
+    try:
+        return graph.invoke(None, config), False
     except AckLost:
-        return graph.get_state(config).values, True
+        # 4. The effect committed but its acknowledgement never arrived. Retry.
+        return graph.invoke(None, config), True
 
 
 def _matches(scenario: Scenario, proposed: Optional[Dict[str, Any]]) -> bool:
@@ -193,20 +213,25 @@ def _action_only(proposal: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _check(scenario: Scenario, outcome: str, tools: Dict[str, Any], start: Dict[str, Any],
-           ledger: Ledger, attempts: List[str], written: List[Dict[str, Any]]) -> List[str]:
+           ledger: Ledger, attempts: List[str], earlier: List[Dict[str, Any]],
+           written: List[Dict[str, Any]]) -> List[str]:
     failures: List[str] = []
 
     # Tool state must be exactly what the outcome implies, computed independently
-    # of the tools' own write code. `written` holds the actions the agent actually
-    # proposed whose effect should have landed (a real model writes its own text).
-    expected_state = _expected_state(scenario, tools, start, written)
+    # of the tools' own write code. `earlier` and `written` hold the actions the
+    # agent actually proposed whose effect should have landed, before and after
+    # the mutations (a real model writes its own text).
+    expected_state = _expected_state(scenario, tools, start, earlier, written)
     for name, t in tools.items():
         actual = t.dump()
         if actual != expected_state[name]:
             failures.append(f"{outcome}, but {name} state is {actual}, expected {expected_state[name]}")
 
+    # A lost ack means the first effect was never logged: the run's ledger shows
+    # only what happened on the retry.
     want = {"blocked": ["approval", "recheck", "block"],
-            "allowed": ["approval", "recheck", "allow"]}.get(outcome)
+            "allowed": ["approval", "recheck", "allow"],
+            "deduplicated": ["approval", "recheck", "duplicate_suppressed"]}.get(outcome)
     entries = ledger.entries(attempts[-1])
     events = [e["event"] for e in entries]
     if want is not None and events != want:
@@ -215,11 +240,14 @@ def _check(scenario: Scenario, outcome: str, tools: Dict[str, Any], start: Dict[
         named = entries[-1]["payload"].get("changed_fields")
         if named != list(scenario.expected_changed_fields):
             failures.append(f"block names {named}, expected {list(scenario.expected_changed_fields)}")
-    if scenario.fault == "lost_ack":
-        # The ack never came back, so the guardrail never logged the allow.
+    elif outcome == "deduplicated":
+        # The duplicate was refused under the key minted at this run's approval.
+        if entries[-1]["payload"]["idempotency_key"] != entries[0]["payload"]["idempotency_key"]:
+            failures.append("suppressed key differs from the key minted at approval")
+    if scenario.fault == "repeat_plan":
         first = [e["event"] for e in ledger.entries(attempts[0])]
-        if first != ["approval", "recheck"]:
-            failures.append(f"lost-ack attempt ledger events {first}, expected approval, recheck")
+        if first != ["approval", "recheck", "allow"]:
+            failures.append(f"earlier plan ledger events {first}, expected approval, recheck, allow")
 
     if not ledger.verify_chain():
         failures.append("ledger hash chain failed verification")
@@ -227,19 +255,26 @@ def _check(scenario: Scenario, outcome: str, tools: Dict[str, Any], start: Dict[
 
 
 def _expected_state(scenario: Scenario, tools: Dict[str, Any], start: Dict[str, Any],
-                    written: List[Dict[str, Any]]) -> Dict[str, Any]:
+                    earlier: List[Dict[str, Any]], written: List[Dict[str, Any]]) -> Dict[str, Any]:
     state = copy.deepcopy(start)
+    acting = state[scenario.tool]
+    simulate = tools[scenario.tool].simulate_effect
+    for action in earlier:
+        acting["effects"] += simulate(action, acting["records"])
     for tool_name, target, changes in scenario.mutations:
         state[tool_name]["records"][target].update(changes)
-    acting = state[scenario.tool]
     for action in written:
-        acting["effects"] += tools[scenario.tool].simulate_effect(action, acting["records"])
+        acting["effects"] += simulate(action, acting["records"])
     return state
 
 
 def _apply_mutations(scenario: Scenario, tools: Dict[str, Any]) -> None:
     for tool_name, target, changes in scenario.mutations:
         tools[tool_name].mutate_out_of_band(target, changes)
+
+
+def _new_run_id(slug: str) -> str:
+    return f"{slug}-{uuid.uuid4().hex[:8]}"
 
 
 def _drop_ack() -> None:

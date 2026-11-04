@@ -64,9 +64,10 @@ class MailerTool:
         return {}
 
     def apply(self, action: Dict[str, Any], expected: Dict[str, Any],
-              bounds: Sequence[Tuple[str, str, Any]]) -> SendResult:
+              bounds: Sequence[Tuple[str, str, Any]], idempotency_key: str) -> SendResult:
         return self.mailer.conditional_send(
-            action["contact_id"], expected, action["subject"], action["body"], bounds)
+            action["contact_id"], expected, action["subject"], action["body"], bounds,
+            idempotency_key=idempotency_key)
 
     # ---- scenario harness ---------------------------------------------------
 

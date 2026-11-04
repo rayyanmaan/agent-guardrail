@@ -19,9 +19,17 @@ contact alone; a CRM edit is matched on every key. `scripted_only` marks a
 scenario whose premise is agent misbehaviour a benign model will not produce
 on cue; the real-model validation pass skips it.
 
-`mechanism` says whether the case is the kind of failure recheck-before-effect
-is built to catch ("recheck") or a sequence failure outside its scope
-("not-recheck"). `shape` names the failure shape, so uncaught ones can be listed.
+`mechanism` names the guardrail mechanism the case exercises: "recheck"
+(a fact the action depends on changed), "idempotency" (a retry of an action
+that already took effect, or a legitimate repeat that must not be mistaken for
+one), or "none" (a failure no mechanism here is built to catch). `shape` names
+the failure shape, so uncaught ones can be listed.
+
+`fault` injects a sequence failure:
+  lost_ack     the effect commits, its acknowledgement is dropped, and the same
+               approved action is retried (the run resumes at the effect)
+  repeat_plan  the same action is first approved and applied in an earlier,
+               separate plan; mutations at "between_plans" land after it
 """
 
 from __future__ import annotations
@@ -31,15 +39,16 @@ from typing import Any, Dict, Optional, Tuple
 
 EXPECTED = ("BLOCK", "ALLOW")
 LABELS = ("irrelevant", "within_limits", "outside_limits", "net_zero")
-MECHANISMS = ("recheck", "not-recheck")
-FAULTS = (None, "lost_ack")
+MECHANISMS = ("recheck", "idempotency", "none")
+FAULTS = (None, "lost_ack", "repeat_plan")
 
 # When the out-of-band changes land:
 #   after_read      after the agent read the target, before the proposal reaches the guardrail
 #   after_approval  while the approved action waits (the graph's interrupt)
 #   before_write    after recheck passed, before the compare-and-set write
+#   between_plans   after the earlier plan's effect, before this plan starts (repeat_plan only)
 #   none            nothing changes
-MUTATION_POINTS = ("after_read", "after_approval", "before_write", "none")
+MUTATION_POINTS = ("after_read", "after_approval", "before_write", "between_plans", "none")
 
 Mutation = Tuple[str, str, Dict[str, Any]]   # (tool, target id, changes)
 
@@ -52,14 +61,14 @@ class Scenario:
     expected: str                         # "BLOCK" | "ALLOW", ground truth
     mechanism: str                        # see MECHANISMS
     shape: str                            # e.g. "stale_fact", "legitimate", "lost_ack_retry"
-    label: Optional[str]                  # see LABELS; None for not-recheck cases
+    label: Optional[str]                  # see LABELS; recheck cases only
     seed: Dict[str, Tuple[Dict[str, Any], ...]]  # tool -> rows at S0
     task: str                             # instruction given to the agent
     script: Tuple[Tuple[str, Dict[str, Any]], ...]  # ScriptedPlanner calls
     proposal: Dict[str, Any]              # the action the agent is expected to propose, with "tool"
     mutations: Tuple[Mutation, ...]       # applied in order at mutate_at
     mutate_at: str                        # see MUTATION_POINTS
-    fault: Optional[str] = None           # "lost_ack": first write commits, its ack is dropped, run retries
+    fault: Optional[str] = None           # see FAULTS
     expected_changed_fields: Tuple[str, ...] = field(default=())  # fields a BLOCK must name
     match_keys: Optional[Tuple[str, ...]] = None  # proposal keys the agent must match; None = all
     scripted_only: bool = False           # premise needs a misbehaving agent; skip with a real model
@@ -70,7 +79,7 @@ class Scenario:
             raise ValueError(f"{k}: expected must be one of {EXPECTED}")
         if self.mechanism not in MECHANISMS:
             raise ValueError(f"{k}: mechanism must be one of {MECHANISMS}")
-        if (self.label is None) != (self.mechanism == "not-recheck"):
+        if (self.label is not None) != (self.mechanism == "recheck"):
             raise ValueError(f"{k}: label is set for recheck cases and only for them")
         if self.label is not None and self.label not in LABELS:
             raise ValueError(f"{k}: label must be one of {LABELS}")
@@ -80,6 +89,8 @@ class Scenario:
             raise ValueError(f"{k}: mutate_at 'none' if and only if there are no mutations")
         if self.fault not in FAULTS:
             raise ValueError(f"{k}: fault must be one of {FAULTS}")
+        if (self.mutate_at == "between_plans") and self.fault != "repeat_plan":
+            raise ValueError(f"{k}: mutate_at 'between_plans' needs fault 'repeat_plan'")
         if self.proposal.get("tool") != self.tool:
             raise ValueError(f"{k}: proposal must name tool {self.tool!r}")
         if self.match_keys is not None and ("tool" not in self.match_keys
@@ -91,7 +102,8 @@ class Scenario:
 
     @property
     def in_scope(self) -> bool:
-        return self.mechanism == "recheck"
+        """Some mechanism here is built to catch this failure shape."""
+        return self.mechanism != "none"
 
     @property
     def expected_outcome(self) -> str:
