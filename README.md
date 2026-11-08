@@ -221,6 +221,8 @@ contact.
 agent ⇄ act  →  approve  →  [interrupt]  →  recheck  →  effect | block
 ```
 
+![Flow: the agent reads and proposes, the guardrail approves, pauses, rechecks, then either writes or blocks. Every decision goes to the ledger.](docs/flow.png)
+
 1. **agent / act.** The model reads what it needs and calls one propose tool. It
    has no write tool. Each read is stored with its timestamp as the **decision
    snapshot**. When the model proposes, trusted code attaches the read of that
@@ -240,6 +242,14 @@ agent ⇄ act  →  approve  →  [interrupt]  →  recheck  →  effect | block
    `INSERT ... SELECT ... WHERE` with the key in the outbox row. A change that
    lands after the recheck is refused. A key that was already applied is logged
    as `duplicate_suppressed`, and the original effect is returned.
+
+### Data model
+
+Each scenario run uses three SQLite files: the ledger, the CRM and the mailer.
+The idempotency key in the ledger's approval entry is the same key stored with
+the effect, in `applied_changes` (CRM) or `outbox` (mailer).
+
+![Database schema: the ledger table, the CRM's customers and applied_changes tables, and the mailer's contacts and outbox tables.](docs/schema.png)
 
 ### Dependency kinds
 
@@ -443,6 +453,7 @@ guardrail/              reusable core: ledger, recheck, policies, idempotency ke
 tools/                  the two tools: mock stores, dependency sets, adapters, registry
 scenarios/              scenario definitions, the runner and the metrics
 tests/                  unit tests and the pinned benchmark numbers
+docs/                   flow and schema diagrams (PNG, with SVG sources)
 ```
 
 ### Adding a tool
