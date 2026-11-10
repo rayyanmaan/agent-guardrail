@@ -3,6 +3,7 @@
     python run.py --scripted         # headline benchmark: deterministic scripted planner
     python run.py                    # validation pass: real agent via Ollama (qwen2.5:7b-instruct)
     python run.py --policy canonical # one policy only (default: all three)
+    python run.py --explain status_cancelled   # one scenario, every decision in plain English
 
 Policies: naive (strict equality on every dependency), bounded (equality +
 bounds, strict comparison), canonical (bounded + per-field canonicalization and
@@ -29,6 +30,8 @@ and its invalid rate and observations are model-reliability findings.
 from __future__ import annotations
 
 import argparse
+import glob
+import os
 import sys
 import tempfile
 import warnings
@@ -40,10 +43,12 @@ warnings.filterwarnings("ignore", message=".*OpenSSL.*")
 warnings.filterwarnings("ignore", message=".*allowed_objects.*")
 
 from agent.graph import ScriptedPlanner, make_ollama_model  # noqa: E402
-from scenarios.benchmark import SCENARIOS  # noqa: E402
+from guardrail.ledger import Ledger  # noqa: E402
+from scenarios.benchmark import BY_KEY, SCENARIOS  # noqa: E402
+from scenarios.explain import explain_ledger  # noqa: E402
 from scenarios.metrics import (Summary, by_mechanism, by_tool, format_rate, format_table,  # noqa: E402
                                summarize)
-from scenarios.runner import run_benchmark  # noqa: E402
+from scenarios.runner import run_benchmark, run_scenario  # noqa: E402
 from tools.registry import TOOL_SCHEMAS, TOOL_TYPES  # noqa: E402
 
 POLICY_NAMES = ("naive", "bounded", "canonical")
@@ -61,7 +66,13 @@ def main() -> int:
     parser.add_argument("--model", default="qwen2.5:7b-instruct", help="Ollama model name")
     parser.add_argument("--policy", choices=POLICY_NAMES + ("all",), default="all")
     parser.add_argument("--workdir", help="where to write the SQLite files (default: a temp dir)")
+    parser.add_argument("--explain", metavar="SCENARIO_KEY",
+                        help="run one scenario (scripted) and print its ledger in plain English")
     args = parser.parse_args()
+
+    if args.explain:
+        policy = "canonical" if args.policy == "all" else args.policy
+        return explain(args.explain, policy, args.workdir or "explain-run")
 
     if args.scripted:
         make_model = lambda s: ScriptedPlanner(s.script)
@@ -152,6 +163,33 @@ def main() -> int:
         print(f"\n  False alarms cleared:            {', '.join(sorted(cleared)) or 'none'}")
         print(f"  Dangerous cases newly allowed:   {', '.join(sorted(flipped)) or 'none'}")
     return 0 if harness_ok else 1
+
+
+def explain(key: str, policy: str, workdir: str) -> int:
+    """Run one scenario with the scripted planner and print its ledger in plain English."""
+    scenario = BY_KEY.get(key)
+    if scenario is None:
+        print(f"Unknown scenario {key!r}. Available scenarios:")
+        for k in BY_KEY:
+            print(f"  {k}")
+        return 2
+    os.makedirs(workdir, exist_ok=True)
+    slug = f"{key}_{policy}"
+    for stale in glob.glob(os.path.join(workdir, f"{slug}_*.sqlite")):
+        os.remove(stale)   # a fresh run each time, so the ledger holds only this one
+    result = run_scenario(scenario, lambda s: ScriptedPlanner(s.script), workdir, TOOL_TYPES, policy)
+    ledger = Ledger(os.path.join(workdir, f"{slug}_ledger.sqlite"))
+    try:
+        entries, chain_ok = ledger.entries(), ledger.verify_chain()
+    finally:
+        ledger.close()
+    print(f"Scenario:  {key} ({scenario.tool})")
+    print(f"           {scenario.name}")
+    print(f"Expected:  {scenario.expected}    Got: {result.actual or result.outcome}    "
+          f"Policy: {policy}    Planner: scripted")
+    print(f"Databases: {workdir}")
+    print("\n".join(explain_ledger(entries, chain_ok)))
+    return 0
 
 
 def _print_metrics(columns: dict) -> None:
