@@ -44,6 +44,7 @@ pip install -r requirements.txt
 # Headline benchmark: deterministic, no Ollama needed, a few seconds
 python run.py --scripted
 python run.py --scripted --policy canonical   # one policy only
+python run.py --explain status_cancelled      # one scenario, every decision in plain English
 
 # Unit tests (no Ollama needed)
 pytest
