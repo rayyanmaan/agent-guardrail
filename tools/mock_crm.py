@@ -19,8 +19,9 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 # Whitelisted columns. Field names arrive from model output, so they must
 # never be interpolated into SQL unless they appear here.
 COLUMNS = ("id", "name", "email", "status", "plan", "seats", "notes", "last_contacted",
-           "discount_pct", "balance_due")
-EDITABLE_FIELDS = frozenset(COLUMNS) - {"id"}
+           "discount_pct", "balance_due", "updated_at")
+# updated_at is maintained by the system (background jobs), not edited by the agent.
+EDITABLE_FIELDS = frozenset(COLUMNS) - {"id", "updated_at"}
 BOUND_OPS = ("<=", ">=")
 
 
@@ -42,7 +43,7 @@ class MockCRM:
                 id TEXT PRIMARY KEY,
                 name TEXT, email TEXT, status TEXT, plan TEXT,
                 seats INTEGER, notes TEXT, last_contacted TEXT,
-                discount_pct INTEGER, balance_due INTEGER
+                discount_pct INTEGER, balance_due INTEGER, updated_at TEXT
             )"""
         )
         # One row per applied change. The key lives with the change, written in

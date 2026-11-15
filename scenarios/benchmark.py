@@ -11,7 +11,11 @@ NOT_CO_DESIGNED = (crm_benchmark.HARDER_SCENARIOS + mailer_benchmark.SCENARIOS
 # legitimate repeats that idempotency must not suppress.
 IDEMPOTENCY_ADDITIONS = crm_benchmark.IDEMPOTENCY_SCENARIOS + [mailer_benchmark.MAILER_RESEND_NEW_PLAN]
 
+# Added from reported false-alarm shapes, expected outcomes decided before running.
+REPORTED_ADDITIONS = list(crm_benchmark.REPORTED_SCENARIOS)
+
 ORIGINAL_BENCHMARK = CO_DESIGNED + NOT_CO_DESIGNED   # the 23 before idempotency
-SCENARIOS = ORIGINAL_BENCHMARK + IDEMPOTENCY_ADDITIONS
+IDEMPOTENCY_BENCHMARK = ORIGINAL_BENCHMARK + IDEMPOTENCY_ADDITIONS   # the 26 with idempotency
+SCENARIOS = IDEMPOTENCY_BENCHMARK + REPORTED_ADDITIONS
 BY_KEY = {s.key: s for s in SCENARIOS}
 assert len(BY_KEY) == len(SCENARIOS), "scenario keys must be unique"
