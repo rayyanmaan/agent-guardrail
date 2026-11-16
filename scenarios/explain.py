@@ -51,11 +51,18 @@ def _approval(p: Dict[str, Any]) -> List[str]:
     lines = ["Approval",
              f"  The agent read: {snapshot}",
              f"  It proposed: {_proposal(p.get('proposal') or {})}",
-             f"  Policy: {p.get('policy')}",
-             "  Conditions checked before the write:"]
+             f"  Policy: {p.get('policy')}"]
+    if p.get("dependency_set"):
+        lines.append(f"  Declared dependencies: {declared_dependencies(p['dependency_set'])}")
+    lines.append("  Conditions checked before the write:")
     lines += [f"    - {condition_sentence(c)}" for c in p.get("conditions", [])]
     lines.append(f"  Idempotency key: {_short(p.get('idempotency_key'))}")
     return lines
+
+
+def declared_dependencies(deps: Sequence[Dict[str, Any]]) -> str:
+    return ", ".join(f"{d['field']} (bounded, {d['op']})" if d["kind"] == "Bound"
+                     else f"{d['field']} (must not change)" for d in deps)
 
 
 def condition_sentence(c: Dict[str, Any]) -> str:

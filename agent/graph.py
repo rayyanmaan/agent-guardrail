@@ -55,7 +55,7 @@ from langgraph.graph.message import add_messages
 
 from guardrail.idempotency import intent_key
 from guardrail.ledger import Ledger
-from guardrail.policy import POLICIES
+from guardrail.policy import POLICIES, Bound
 from guardrail.recheck import Condition, evaluate, take_snapshot
 from guardrail.tool import GuardedTool
 
@@ -196,6 +196,7 @@ def build_graph(
             "decision_snapshot": snapshot,
             "conditions": [c.to_dict() for c in conditions],
             "idempotency_key": key,
+            "dependency_set": dependency_set(deps),
         })
         return {"conditions": [c.to_dict() for c in conditions], "idempotency_key": key}
 
@@ -282,6 +283,12 @@ def build_graph(
     # Pause after approval: this is where a human would sign off, and where the
     # world can drift away from the approved snapshot.
     return g.compile(checkpointer=InMemorySaver(), interrupt_before=["recheck"])
+
+
+def dependency_set(deps: Sequence[Any]) -> List[Dict[str, Any]]:
+    """The declared dependencies as recorded, before they are compiled into conditions."""
+    return [{"field": d.field, "kind": "Bound", "op": d.op} if isinstance(d, Bound)
+            else {"field": d.field, "kind": "Equality"} for d in deps]
 
 
 def _now() -> str:

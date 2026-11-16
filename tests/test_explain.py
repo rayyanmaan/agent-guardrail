@@ -100,3 +100,18 @@ def test_two_plans_are_shown_separately_and_a_broken_chain_says_no():
 def test_no_raw_json_in_the_output():
     out = text(explain_ledger([APPROVAL, STALE_RECHECK, STALE_BLOCK], chain_ok=True))
     assert "{" not in out and "}" not in out
+
+
+def test_approval_lists_the_declared_dependencies():
+    approval = entry("approval", {**APPROVAL["payload"], "dependency_set": [
+        {"field": "plan", "kind": "Equality"}, {"field": "status", "kind": "Equality"},
+        {"field": "seats", "kind": "Bound", "op": "<="}]})
+    out = text(explain_entry(approval))
+    assert ("Declared dependencies: plan (must not change), status (must not change), "
+            "seats (bounded, <=)") in out
+    assert "{" not in out
+
+
+def test_approval_without_a_dependency_set_still_reads():
+    # Ledgers written before the field existed have no dependency_set.
+    assert "Declared dependencies" not in text(explain_entry(APPROVAL))
