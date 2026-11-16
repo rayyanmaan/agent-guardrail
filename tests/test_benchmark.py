@@ -77,7 +77,7 @@ def test_proposal_without_a_read_is_refused(tmp_path, crm):
     assert state["outcome"] == "no_proposal"
     assert "read_record" in state["messages"][-1].content
     assert ledger.entries("r") == []
-    assert crm.read_record("C-1001") == SEED
+    assert crm.read_record("C-1001") == {**SEED, "updated_at": None}
 
 
 # ---- predicate (bound) fields ---------------------------------------------

@@ -77,7 +77,7 @@ def test_conditional_update_ignores_unrelated_drift(crm):
     result = crm.conditional_update("C-1001", {"plan": "starter", "status": "active"}, {"plan": "growth"},
                                     idempotency_key="k1")
     assert result.written
-    assert crm.read_record("C-1001") == {**RECORD, "notes": "changed", "plan": "growth"}
+    assert crm.read_record("C-1001") == {**RECORD, "notes": "changed", "plan": "growth", "updated_at": None}
 
 
 def test_conditional_update_requires_snapshot(crm):

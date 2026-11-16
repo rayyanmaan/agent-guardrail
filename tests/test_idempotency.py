@@ -15,7 +15,7 @@ from langchain_core.messages import HumanMessage
 from agent.graph import ScriptedPlanner, build_graph
 from guardrail.idempotency import intent_key
 from guardrail.ledger import Ledger
-from scenarios.benchmark import BY_KEY, SCENARIOS
+from scenarios.benchmark import BY_KEY, IDEMPOTENCY_BENCHMARK as SCENARIOS
 from scenarios.mailer_benchmark import CONTACT, SEND
 from scenarios.metrics import by_mechanism, summarize
 from scenarios.runner import run_benchmark, run_scenario

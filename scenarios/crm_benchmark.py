@@ -192,3 +192,18 @@ CRM_REUPGRADE_NEW_PLAN = Scenario(
     mutate_at="between_plans", fault="repeat_plan")
 
 IDEMPOTENCY_SCENARIOS = [CRM_LOST_ACK_RETRY, CRM_REUPGRADE_NEW_PLAN]
+
+# ---- Reported false-alarm shapes -----------------------------------------------
+
+# Expected: ALLOW under every policy, decided before running. A background job
+# bumps the record's updated_at after the agent reads it; nothing the upgrade
+# depends on (plan, status, seats) changes. A whole-record version check would
+# block this. Dependencies here are explicit per field and updated_at is in no
+# dependency set, so the recheck should find nothing changed.
+UPDATED_AT_SEED = {**SEED, "updated_at": "2026-10-01T09:00:00Z"}
+UPDATED_AT_BUMP = _edit(
+    "updated_at_bump", "Only updated_at is bumped by a background job (version-style change)",
+    "ALLOW", "irrelevant", {"updated_at": "2026-11-15T03:00:00Z"}, "after_read",
+    seed=UPDATED_AT_SEED)
+
+REPORTED_SCENARIOS = [UPDATED_AT_BUMP]
