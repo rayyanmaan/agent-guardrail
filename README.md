@@ -44,7 +44,7 @@ pip install -r requirements.txt
 # Headline benchmark: deterministic, no Ollama needed, a few seconds
 python run.py --scripted
 python run.py --scripted --policy canonical   # one policy only
-python run.py --explain status_cancelled      # one scenario, every decision in plain English
+python run.py --explain <scenario_key>        # one scenario's decision in plain words (e.g. status_cancelled)
 
 # Unit tests (no Ollama needed)
 pytest
@@ -68,8 +68,8 @@ For each policy, one line per scenario, then a summary:
                      overall         crm             mailer
   in-scope catch     100% (11/11)    100% (7/7)      100% (4/4)
   overall coverage   92% (11/12)     100% (7/7)      80% (4/5)
-  false-alarm rate   0% (0/14)       0% (0/10)       0% (0/4)
-  invalid rate       0% (0/26)       0% (0/17)       0% (0/9)
+  false-alarm rate   0% (0/15)       0% (0/11)       0% (0/4)
+  invalid rate       0% (0/27)       0% (0/18)       0% (0/9)
 ```
 
 - **PASS:** the right call, the final database state matches it, and the
@@ -86,13 +86,13 @@ existing folder instead.
 
 ## Results
 
-Headline benchmark (`--scripted`, 26 scenarios, three policies):
+Headline benchmark (`--scripted`, 27 scenarios, three policies):
 
 ```
                      naive           bounded         canonical
   in-scope catch     100% (11/11)    100% (11/11)    100% (11/11)
   overall coverage   92% (11/12)     92% (11/12)     92% (11/12)
-  false-alarm rate   43% (6/14)      14% (2/14)      0% (0/14)
+  false-alarm rate   40% (6/15)      13% (2/15)      0% (0/15)
 
   by mechanism       naive           bounded         canonical
   recheck catch      100% (9/9)      100% (9/9)      100% (9/9)
@@ -118,7 +118,7 @@ The three numbers are reported separately, never combined:
   email that leaks another customer's deal terms. Nothing changed and nothing
   was retried; catching it needs information-flow tracking. The gap between the
   two numbers is the boundary of what these mechanisms do.
-- **False-alarm rate:** the 14 legitimate cases, wrongly blocked.
+- **False-alarm rate:** the 15 legitimate cases, wrongly blocked.
 
 **Where the false alarms come from.** Naive blocks every within-limit move of a
 bound field (for example seats 5 → 8 under a cap of 20). Bounded fixes that and
@@ -143,7 +143,7 @@ Every accepted equivalence is recorded in the ledger's recheck entry, and the
 write itself still requires the exact values the recheck accepted.
 
 **How the scenarios were made.** The first 10 CRM scenarios were written
-together with the policy. The other 16 were added later, with each expected
+together with the policy. The other 17 were added later, with each expected
 outcome written down before running the policy on it. They are small and
 hand-built, so the numbers show behaviour on these cases, not a real-world rate.
 
@@ -154,7 +154,7 @@ hand-built, so the numbers show behaviour on these cases, not a real-world rate.
 | Command | `python run.py --scripted` | `python run.py` (needs Ollama) |
 | Agent | a fixed script of tool calls | a real model (`qwen2.5:7b-instruct`) |
 | Deterministic | yes | no |
-| Scenarios | all 26 | 25 (the disclosure case is scripted only) |
+| Scenarios | all 27 | 26 (the disclosure case is scripted only) |
 | Measures | catch rate, coverage, false alarms | same decisions with a real agent? plus the invalid rate |
 
 The headline numbers come from the scripted run. Only the agent changes between
@@ -163,6 +163,9 @@ own email text, so sends are matched on the recipient, not the wording. The
 disclosure case needs an agent that leaks data on cue, so it only runs scripted.
 
 ### Validation pass result (`qwen2.5:7b-instruct`, 25 scenarios, one run per policy)
+
+This run predates the `updated_at_bump` scenario, so it covers 25 scenarios and 14
+legitimate cases.
 
 ```
                      naive           bounded         canonical
@@ -191,7 +194,9 @@ disclosure case needs an agent that leaks data on cue, so it only runs scripted.
    no write tool. Its read becomes the **decision snapshot**, attached by trusted
    code. A proposal for a record it never read is refused.
 2. **Approve.** The tool's dependencies become **conditions** based on the
-   snapshot, and the guardrail mints the **idempotency key**.
+   snapshot, and the guardrail mints the **idempotency key**. The approval
+   ledger entry records the declared dependency set as well as the compiled
+   conditions.
 3. **Pause.** Where a human would approve, and where the world may change.
 4. **Recheck.** The record is read again and every condition checked. If one
    fails, the action is blocked and the ledger names the field that moved.
@@ -205,6 +210,9 @@ disclosure case needs an agent that leaks data on cue, so it only runs scripted.
 |---|---|---|
 | `Equality` | Must not change (optionally up to a canonical form) | CRM `plan`, `status`; mailer `recipient_email`, `opt_in_status` |
 | `Bound` | May change, within an approved limit | CRM `seats <= 20`; `balance_due <= 1000` |
+
+A declared dependency field that is missing (for example, renamed upstream) fails
+closed: it raises at approval and blocks at recheck, and never passes silently.
 
 ### Data model
 
